@@ -13,6 +13,11 @@ On `c3046d1`:
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
 - **`0002 0003 0004 0005 0005a 0006` apply unchanged, zero rejects**, in glob order.
   (`0005a` must still precede `0006`; the glob order does that.)
+- **`0007` and `0008` also apply unchanged, zero rejects** — the range touches neither
+  `vllm/parser/` nor `rejection_sampler_utils.py`. Verified 2026-08-21: all eight patches
+  (`0002`–`0008`) applied from the reconstructed tree reproduce the same patched files as
+  the `f8ea5bb` series, except `sparse_attn_indexer.py`, which legitimately differs
+  (c3046d1 carries the 0001 gate upstream).
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.
@@ -48,7 +53,7 @@ your working tree is byte-identical to `c3046d1`.
 
 ---
 
-## Legacy base `f8ea5bb` (all seven patches)
+## Legacy base `f8ea5bb` (all nine patches)
 
 Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)
 (commit `f8ea5bb`). Apply with `patch -p1` from the vLLM checkout root.
@@ -65,7 +70,7 @@ Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/ds
 > git checkout f8ea5bb
 > ```
 >
-> Verified end to end: from that checkout the seven patches apply in glob order with **zero
+> Verified end to end: from that checkout the nine patches apply in glob order with **zero
 > rejects** and reproduce our live production tree byte-for-byte. (Reported in
 > [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1).)
 
@@ -82,8 +87,40 @@ rebuilding — which is what [`launch/run-pp-dspark.sh`](../launch/run-pp-dspark
 | 0005 | `v1/worker/gpu/spec_decode/dspark/utils.py` | drop `NotImplementedError("DSpark does not support pipeline parallelism.")`; add `_has_real_weight()`; load the draft's token embedding from the checkpoint | Under PP the target's `embed_tokens` is a `PPMissingLayer` on the drafter's rank — and **aliasing one is a silent no-op, not an error**, hence the explicit check. The embedding (~1 GB) is read straight from `embed.weight` in the checkpoint, which avoids adding a cross-rank collective to model load. |
 | **0005a** | `model_executor/layers/sparse_attn_indexer.py` **(must precede 0006)** | add `_prefill_topk_needs_torch_fallback()`, `_top_k_per_row_prefill_torch()`, and the prefill `if fallback / else CUDA kernel` branch | ★ **Patches 0001-0006 as first published were INCOMPLETE in two ways.** (1) Those two functions were called at four sites and defined nowhere. (2) 0006 does not *add* the fallback branch — it *rewrites* one, turning `if _prefill_topk_needs_torch_fallback():` into an `elif` and carrying `_top_k_per_row_prefill_torch(` as unchanged context — while the base `f8ea5bb` has a bare unconditional `ops.top_k_per_row_prefill(...)`. So supplying only the definitions is **not** enough. Reported by @fouvy, diagnosed by @snoby in [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1). Named `0005a` so a plain `patches/*.patch` glob applies it before 0006. **The fallback is ACTIVE on sm_80 by design — see below.** |
 | **0006** | `model_executor/layers/sparse_attn_indexer.py` **(stacks on 0001)** | row-chunk the `[M, N]` float32 logits transient, gated by `DSV4_LOGITS_ROW_CHUNK` | ★ **The context-ceiling fix — ~134k → 1,047,736 tokens.** `fp8_mqa_logits_triton` allocates `logits = torch.empty((M, N), float32)` (`M` = prefill-chunk tokens, `N = seq_len / compress_ratio`) and hands the whole buffer to the top-k; it grows with context and is the largest allocation on the Triton fallback path. **Each row's top-k reads only its own `[ks, ke)`, so rows are independent and blocking them is exact, not approximate.** Default-OFF (`0` reproduces upstream byte-for-byte) because it is the same file as 0001 and you may want to bisect them. `256` reaches ~957,600; `128` reaches the full 1M. Costs nothing measurable — prefill 1,456 vs 1,448 tok/s at 4k, and the change is inside `if has_prefill:` so decode cannot be affected. |
+| **0007** | `parser/deepseek_v4.py`, `parser/engine/parser_engine_config.py`, `parser/engine/streaming_parser_engine.py` (+ the PR's tests) | recover tool calls from `<｜DSML｜invoke>` blocks emitted with a missing or corrupted outer `<｜DSML｜tool_calls>` wrapper | **[vLLM PR #52645](https://github.com/vllm-project/vllm/pull/52645)**, backported to `f8ea5bb` — see the note below. Without it, one malformed wrapper feeds DSML markup back into agent context and sessions degrade into token soup. Python-only: bind-mountable, no rebuild. |
+| **0008** | `v1/worker/gpu/spec_decode/rejection_sampler_utils.py` (+ the PR's regression test) | map NaN block maxima to `-inf` before `tl.argmax` in `_compute_global_target_argmax` and `_insert_resampled_kernel` | **[vLLM PR #50183](https://github.com/vllm-project/vllm/pull/50183)** verbatim (upstream `47a4e410b`, 2026-08-06); applies clean to `f8ea5bb`. Proposed as "0007" in [#10](https://github.com/allover326/deepseek-v4-cmp170hx/issues/10) before our 0007 existed — hence the number shift. **The DSpark corruption fix.** An all-NaN target-logits row makes `tl.argmax` return an out-of-range block index → OOB read → an *arbitrary token committed as if verified*. On sm_80 + fp8 KV the NaN rows are real, and the damage is invisible in prose while it shreds structured output (DSML tool calls, digit runs). Two branchless `tl.where` lines on already-loaded values; Triton/Python-only, bind-mountable, no rebuild. Verified: from pristine `f8ea5bb`, `0001 → 0008` apply in glob order with zero rejects; `tests/v1/spec_decode/test_rejection_sampler_utils.py` 30/31 on sm_80 — the one failure (`test_block_verification_accepts_at_least_as_many[5]`) fails identically on the pristine tree, so it is pre-existing and not caused by the guard. |
+| **0009** | `models/deepseek_v4/**` (9 files + deletes `eager_scratch.py`), `csrc/libtorch_stable/*` (3 files), 3 kernel test files | **CUDA-graph/indexer corruption fixes**: (a) never take the indexer short-context shortcut while `torch.cuda.is_current_stream_capturing()`; (b) revert the DSv4 eager scratch pool (model-wide workspace reused across layers/streams without allocator lifetime tracking) | **Upstream [PR #52492](https://github.com/vllm-project/vllm/pull/52492) + [PR #52836](https://github.com/vllm-project/vllm/pull/52836)**, backported — root cause of the **intermittent multi-session corruption windows** (token salad / bad tool calls across ALL sessions at once, spec acceptance dipping ~30 s before visible corruption): capture-time CUDA-graph state disagreeing with runtime sparse-attention metadata, so attention reads wrong context slices. Matches [this DGX Spark analysis](https://forums.developer.nvidia.com/t/deepseek-v4-flash-on-2x-dgx-spark-intermittent-token-corruption-with-mtp-cuda-graphs/380889); our server auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH=1` (PIECEWISE capture) — exactly the configuration (a) fixes, and the eager scratch pool is created unconditionally on our config, which (b) removes. Hand-ported where the fork's sm_80 edits shifted context (`attention.py`, `fused_indexer_q.py`, `nvidia/model.py`, one test file). The `csrc/` part only *removes* the now-unused `_out` fused op — the Python falls back to the allocating variant already in the image, so **no rebuild needed**. PR #51318 from the same report is deliberately **not** carried: it touches `sparse_mla.py` (FlashMLA), which the sm_80 path (`DeepseekV4AmpereMLAAttention`) never uses. Verified: pristine `c3046d1` + `0002 → 0009` reproduce the live tree byte-for-byte; PR kernel tests **197 passed / 0 failed** on sm_80. Requires a whole-directory mount of `models/deepseek_v4` (the patch deletes a file). |
 
-## ⚠️ The sm_80 prefill top-k fallback (0005a) is load-bearing — do not stub it out
+## Patch 0007 (PR #52645 DSML recovery) — partial backport, commits 1–4 only
+
+0007 carries the PR **through `c848ab5`** (commits 1–4). The final upstream commit
+`4f2aae2` (reasoning-adapter delegation) is **excluded**: its own
+`TestDelegatingMalformedWrapperRecovery` regression tests fail when applied here —
+`ParserEngine.finish_streaming` drops `_deferred_reasoning`, so a rolled-back
+candidate loses its preceding newline (`"Still thinking.\n<invoke…"` comes back as
+`"Still thinking.<invoke…"`). That is output corruption in exchange for pre-`</think>`
+bare-invoke recovery, which is not the bug we have. The post-`</think>` corruption
+cascade — the failure this patch exists to stop — is fully covered.
+
+This matches the independent port referenced in the PR thread (randomvariable's), which
+verified the same test failures on a clean worktree of `4f2aae2` against pure upstream.
+
+Differences from the upstream diff, all forced by `f8ea5bb`'s older parser engine:
+
+- `streaming_parser_engine.py` was hand-ported: the base predates the engine's
+  `token_count` plumbing, `_in_skipped_tool_span`, and `_tool_exit_terminals`, so the
+  recovery-hold machinery (`_begin/_advance/_abort/_clear_recovery_hold`,
+  `_emit_for_state_now`, the `_apply_transition`/`_run_transition` split) is applied
+  without token counting, and `_tool_exit_terminals` is added alongside.
+- `abstract_parser.py` / `adapters.py` are **not** touched (those hunks are `4f2aae2`).
+- The delegating test class is dropped from the test hunk (it tests `4f2aae2`).
+
+**Verified:** from pristine `f8ea5bb`, `0001 → 0007` apply in glob order with zero
+rejects and reproduce the live tree byte-for-byte. Tests (in `dsv4-a100:devel`):
+**73/73** `tests/parser/engine/test_deepseek_v4.py`, **3746/3746** `tests/parser/engine/`.
+Generated against `f8ea5bb`; applicability to the `c3046d1` base is untested.
+
+
 
 `_prefill_topk_needs_torch_fallback()` returns **True on sm_80 deliberately**, and patch 0005a
 must not be reduced to `return False`.

@@ -11,6 +11,10 @@ docker run -d --name dsv4 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -v $R/v1/worker/gpu/model_runner.py:/vllm/vllm/v1/worker/gpu/model_runner.py:ro \
   -v $R/v1/worker/gpu/spec_decode/dspark/utils.py:/vllm/vllm/v1/worker/gpu/spec_decode/dspark/utils.py:ro \
   -v $R/model_executor/layers/sparse_attn_indexer.py:/vllm/vllm/model_executor/layers/sparse_attn_indexer.py:ro \
+  -v $R/parser/deepseek_v4.py:/vllm/vllm/parser/deepseek_v4.py:ro \
+  -v $R/parser/engine/parser_engine_config.py:/vllm/vllm/parser/engine/parser_engine_config.py:ro \
+  -v $R/parser/engine/streaming_parser_engine.py:/vllm/vllm/parser/engine/streaming_parser_engine.py:ro \
+  -v $R/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:/vllm/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:ro \
   --shm-size=16g -p 8098:8000 \
   dsv4-a100:devel vllm serve /model --served-model-name dsv4s \
   --pipeline-parallel-size 4 \
@@ -27,7 +31,7 @@ docker run -d --name dsv4 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
 ```
 
 `$R` is the `vllm/` directory of your patched checkout. The image installs vLLM with
-`pip install -e .`, so `/vllm/vllm/...` is live code — bind-mounting the five patched
+`pip install -e .`, so `/vllm/vllm/...` is live code — bind-mounting the nine patched
 files applies them with **no rebuild**.
 
 ---

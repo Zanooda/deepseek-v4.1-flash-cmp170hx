@@ -5,7 +5,7 @@
 # Usage: run-pp-dspark.sh [--plain]      (--plain = PP4 without DSpark, 50.8 t/s)
 #        run-pp-dspark.sh --maxlen 131072
 #
-# DSpark+PP is NOT supported upstream -- it is enabled by seven local patches,
+# DSpark+PP is NOT supported upstream -- it is enabled by ten local patches,
 # applied here by BIND-MOUNT (the image installs vLLM with `pip install -e .`, so
 # /vllm/vllm/... is live code and no rebuild is needed):
 #
@@ -31,6 +31,19 @@
 #                                                 -- THE context-ceiling fix, and it is ENV-GATED;
 #                                                 see DSV4_ROW_CHUNK below or it stays inert
 #                                                 silent corruption at prompt len 2049-4096)
+#   8 parser/deepseek_v4.py + parser/engine/*.py    recover tool calls from malformed/missing
+#                                                 DSML tool_calls wrappers (0007, vLLM PR #52645
+#                                                 through c848ab5; see patches/README.md)
+#   9 v1/worker/gpu/spec_decode/rejection_sampler_utils.py  NaN->-inf guard before tl.argmax
+#                                                 in the rejection sampler (0008, vLLM PR #50183)
+#                                                 -- without it a NaN target-logits row commits an
+#                                                 ARBITRARY token as if verified; shreds DSML
+#                                                 tool calls while plain chat looks fine
+#  10 models/deepseek_v4/** (dir mount)          CUDA-graph/indexer corruption fixes (0009,
+#                                                 vLLM PRs #52492 + #52836): the indexer
+#                                                 short-context shortcut must not be captured
+#                                                 into breakable graphs, and the eager scratch
+#                                                 pool (cross-layer workspace reuse) is removed
 #
 # Why it works at all: for DeepSeek-V4 the DSpark aux-hidden-state taps
 # (dspark_target_layer_ids = [40,41,42] of 43 layers) AND lm_head both land on the
@@ -38,13 +51,13 @@
 # ---- configure these three for your machine -----------------------------------
 IMG="${DSV4_IMAGE:-dsv4-a100:devel}"
 # VLLM_SRC: the vllm/ package directory of your PATCHED checkout. The image installs
-# vLLM with `pip install -e .`, so bind-mounting these five files applies the patches
+# vLLM with `pip install -e .`, so bind-mounting these files applies the patches
 # with no rebuild. If you applied the patches at build time instead, set
 # DSV4_NO_MOUNT=1 and the mounts are skipped.
-R="${DSV4_VLLM_SRC:-/opt/vllm-dsv4/vllm}"
+R="${DSV4_VLLM_SRC:-$HOME/vllm/vllm}"
 MODEL="${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
-MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
+MAXLEN="${DSV4_MAXLEN:-1048576}"    # with ROW_CHUNK set, 393216 and 1048576 both work
 # Patch 0006 is ENV-GATED AND DEFAULTS TO OFF (0). Without this the context-ceiling fix is
 # installed but INERT and you hit the old ~134k wall. Set 0 to reproduce the unpatched
 # upstream path byte-for-byte.
@@ -55,7 +68,13 @@ MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both 
 #                    same depth is fine, so needle tests never catch this.
 # Defaulting to 64: it is the safe value for both, and costs ~5% TTFT at 750k.
 ROW_CHUNK="${DSV4_ROW_CHUNK:-64}"
-SPEC='--speculative-config {"method":"dspark","num_speculative_tokens":5}'
+# Breakable CUDA graphs (the fork's PIECEWISE path for DSv4) are auto-enabled for
+# this model class. retsimx on vllm#50576 (same stack: c3046d1 + this patch series,
+# PP4) reports corruption under concurrency GONE with them OFF; 0009 (vllm#52492)
+# may have fixed the root cause, but off is the proven configuration. Set
+# DSV4_BREAKABLE_CUDAGRAPH=1 to re-enable and test.
+BREAKABLE="${DSV4_BREAKABLE_CUDAGRAPH:-0}"
+SPEC='--speculative-config {"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -87,7 +106,11 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/worker/gpu/pp_utils.py \
            v1/worker/gpu/model_runner.py \
            v1/worker/gpu/spec_decode/dspark/utils.py \
-           model_executor/layers/sparse_attn_indexer.py; do
+           model_executor/layers/sparse_attn_indexer.py \
+           parser/deepseek_v4.py \
+           parser/engine/parser_engine_config.py \
+           parser/engine/streaming_parser_engine.py \
+           v1/worker/gpu/spec_decode/rejection_sampler_utils.py; do
     if [ ! -f "$R/$f" ]; then
       echo "ERROR: $R/$f not found. Set DSV4_VLLM_SRC to the vllm/ directory of your"
       echo "patched checkout, or set DSV4_NO_MOUNT=1 if the patches are baked into \$IMG."
@@ -95,12 +118,21 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
     fi
     MOUNTS="$MOUNTS -v $R/$f:/vllm/vllm/$f:ro"
   done
+  # 0009 touches 9 files under models/deepseek_v4 AND deletes eager_scratch.py,
+  # so it needs a whole-directory mount (a file mount cannot delete).
+  if [ ! -d "$R/models/deepseek_v4" ]; then
+    echo "ERROR: $R/models/deepseek_v4 not found (patch 0009)."
+    exit 1
+  fi
+  MOUNTS="$MOUNTS -v $R/models/deepseek_v4:/vllm/vllm/models/deepseek_v4:ro"
 fi
 
 # shellcheck disable=SC2086
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
+  --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
+  -e VLLM_USE_BREAKABLE_CUDAGRAPH="$BREAKABLE" \
   -v "$MODEL":/model \
   $MOUNTS \
   --shm-size=16g -p 8098:8000 \
@@ -108,6 +140,7 @@ docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,
   --pipeline-parallel-size 4 --kv-cache-dtype fp8 --block-size 256 \
   --max-model-len "$MAXLEN" --max-num-batched-tokens 2048 --trust-remote-code \
   --gpu-memory-utilization 0.85 --max-num-seqs 8 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
   --no-enable-flashinfer-autotune --tokenizer-mode deepseek_v4 \
   $SPEC >/dev/null
 echo "launched dsv4-a100 on :8098  (maxlen $MAXLEN, row_chunk $ROW_CHUNK, spec: ${SPEC:-none})"

@@ -32,7 +32,10 @@ COPY . /vllm/
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
 ENV TORCH_CUDA_ARCH_LIST=8.0
-ENV MAX_JOBS=32
+# 8, not 32: nvcc/cicc jobs each take 2-4 GB, and on a 24-core/30 GB box
+# MAX_JOBS=32 (and even 16) gets the build OOM-killed mid-compile
+# (observed twice 2026-08-21). If you add a large swapfile, raise this back.
+ENV MAX_JOBS=8
 ENV CMAKE_BUILD_TYPE=Release
 ENV VLLM_TARGET_DEVICE=cuda
 

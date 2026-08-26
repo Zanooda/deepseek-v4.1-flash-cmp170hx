@@ -4,7 +4,9 @@
 #
 # Usage: run-a100.sh [--plain]     (--plain = no speculative decoding)
 #
-# Image: dsv4-a100:devel   (built from Dockerfile.devel in this directory)
+# Image: dsv4-a100:devel   (since 2026-08-21 this tag points at the c3046d1 fullbuild
+#        image with patches 0002-0008 baked in; previously the Dockerfile.devel
+#        precompiled build. The TP path has NOT been re-benchmarked on c3046d1.)
 # Model: dsv4-0731-orig    -- the ORIGINAL FP4+FP8 checkpoint, NOT our CT repack.
 #        This branch handles the native checkpoint, so the repack is unnecessary.
 #
@@ -33,6 +35,7 @@ fi
 
 # shellcheck disable=SC2086
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
+  --restart unless-stopped \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -v ${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}:/model --shm-size=16g -p 8098:8000 \
   dsv4-a100:devel vllm serve /model --served-model-name dsv4s \

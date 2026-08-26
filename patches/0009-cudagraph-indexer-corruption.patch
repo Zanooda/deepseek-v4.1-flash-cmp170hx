@@ -1,0 +1,756 @@
+diff --git a/csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu b/csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu
+index ae93266a4..7bc435b8e 100644
+--- a/csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu
++++ b/csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu
+@@ -942,10 +942,9 @@ static void launchFullCacheKernel(
+ // ────────────────────────────────────────────────────────────────────────────
+ // Torch op wrapper
+ // ────────────────────────────────────────────────────────────────────────────
+-void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
++torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+     torch::stable::Tensor const& q_in,           // [N, num_heads_q, 512] bf16
+     torch::stable::Tensor const& kv,             // [N, 512] bf16 (read-only)
+-    torch::stable::Tensor& q_out,                // [N, q_head_padded, 512]
+     torch::stable::Tensor& k_cache,              // [num_blocks, block_bytes] uint8
+     torch::stable::Tensor const& slot_mapping,   // [N] int64
+     torch::stable::Tensor const& position_ids,   // [N] int64
+@@ -971,16 +970,8 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+   STD_TORCH_CHECK(kv.dim() == 2 && kv.size(1) == 512, "kv shape [N, 512]");
+   STD_TORCH_CHECK(q_in.scalar_type() == kv.scalar_type(),
+                   "q_in and kv dtype must match");
+-  STD_TORCH_CHECK(q_out.device() == q_in.device() && q_out.is_contiguous(),
+-                  "q_out must be contiguous and on the same device as q_in");
+-  STD_TORCH_CHECK(q_out.scalar_type() == q_in.scalar_type(),
+-                  "q_out dtype must match q_in");
+   STD_TORCH_CHECK(q_head_padded >= q_in.size(1),
+                   "q_head_padded must be >= q_in.size(1) (num_heads_q)");
+-  STD_TORCH_CHECK(q_out.dim() == 3 && q_out.size(0) == q_in.size(0) &&
+-                      q_out.size(1) == q_head_padded &&
+-                      q_out.size(2) == q_in.size(2),
+-                  "q_out shape [N, q_head_padded, 512]");
+   STD_TORCH_CHECK(k_cache.scalar_type() == torch::headeronly::ScalarType::Byte,
+                   "k_cache must be uint8");
+   STD_TORCH_CHECK(cos_sin_cache.dim() == 2 && cos_sin_cache.size(1) == 64,
+@@ -1008,6 +999,11 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+       q_in.get_device_index());
+   const cudaStream_t stream = get_current_cuda_stream(q_in.get_device_index());
+ 
++  // Allocate the padded q output.  The kernel writes every element (live
++  // region gets RMSNorm+RoPE; pad region gets zeros), so `empty` is safe.
++  auto q_out = torch::stable::new_empty(
++      q_in, {q_in.size(0), q_head_padded, q_in.size(2)}, q_in.scalar_type());
++
+   VLLM_STABLE_DISPATCH_HALF_TYPES(
+       q_in.scalar_type(), "fused_deepseek_v4_qnorm_rope_kv_insert", [&] {
+         using qkv_scalar_t = scalar_t;
+@@ -1024,20 +1020,6 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+                 num_heads_q_padded, cache_block_size_i, kv_block_stride,
+                 stream);
+       });
+-}
+-
+-torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+-    torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
+-    torch::stable::Tensor& k_cache,
+-    torch::stable::Tensor const& slot_mapping,
+-    torch::stable::Tensor const& position_ids,
+-    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
+-    double eps, int64_t cache_block_size) {
+-  auto q_out = torch::stable::new_empty(
+-      q_in, {q_in.size(0), q_head_padded, q_in.size(2)}, q_in.scalar_type());
+-  fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+-      q_in, kv, q_out, k_cache, slot_mapping, position_ids, cos_sin_cache,
+-      q_head_padded, eps, cache_block_size);
+   return q_out;
+ }
+ 
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index 4d0edfa7d..e79f22f1d 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -269,14 +269,6 @@ torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+     torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
+     double eps, int64_t cache_block_size);
+ 
+-void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+-    torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
+-    torch::stable::Tensor& q_out, torch::stable::Tensor& k_cache,
+-    torch::stable::Tensor const& slot_mapping,
+-    torch::stable::Tensor const& position_ids,
+-    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
+-    double eps, int64_t cache_block_size);
+-
+ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+     torch::stable::Tensor& q, torch::stable::Tensor const& kv,
+     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 9c5db6c4d..fec337a89 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -433,11 +433,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+       "Tensor q_in, Tensor kv, Tensor! k_cache, "
+       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+       "int q_head_padded, float eps, int cache_block_size) -> Tensor");
+-  ops.def(
+-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out("
+-      "Tensor q_in, Tensor kv, Tensor! q_out, Tensor! k_cache, "
+-      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+-      "int q_head_padded, float eps, int cache_block_size) -> ()");
+ 
+   // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
+   // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
+@@ -756,8 +751,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
+   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
+-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",
+-           TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out));
+   ops.impl(
+       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
+       TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert));
+diff --git a/tests/kernels/test_compressor_kv_cache.py b/tests/kernels/test_compressor_kv_cache.py
+index 006350779..b4f70f231 100644
+--- a/tests/kernels/test_compressor_kv_cache.py
++++ b/tests/kernels/test_compressor_kv_cache.py
+@@ -20,7 +20,6 @@ import torch
+ 
+ from vllm import _custom_ops as ops
+ from vllm.models.deepseek_v4.common.ops import (
+-    compute_global_topk_indices_and_lens,
+     dequantize_and_gather_k_cache,
+     quantize_and_insert_k_cache,
+ )
+@@ -36,23 +35,6 @@ from vllm.utils.import_utils import is_cutedsl_supported
+ from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
+ 
+ 
+-def test_compute_global_topk_reuses_output_buffers():
+-    device = "cuda"
+-    topk_indices = torch.tensor(
+-        [[0, 3, -1], [1, 2, -1]], dtype=torch.int32, device=device
+-    )
+-    token_to_req = torch.tensor([0, 1], dtype=torch.int32, device=device)
+-    block_table = torch.tensor([[5, 7], [11, 13]], dtype=torch.int32, device=device)
+-    is_valid = torch.tensor([True, False], device=device)
+-    args = (topk_indices, token_to_req, block_table, 2, is_valid)
+-    expected = compute_global_topk_indices_and_lens(*args)
+-    outputs = tuple(torch.empty_like(tensor) for tensor in expected)
+-    actual = compute_global_topk_indices_and_lens(*args, output_buffers=outputs)
+-    for result, output, reference in zip(actual, outputs, expected):
+-        assert result.data_ptr() == output.data_ptr()
+-        torch.testing.assert_close(result, reference)
+-
+-
+ def _ue8m0_reference(x: torch.Tensor, block_size: int, fp8_max: float):
+     """PyTorch reference for UE8M0 FP8 quantization (per-block, power-of-2 scale).
+ 
+diff --git a/tests/kernels/test_fused_indexer_q_rope_quant.py b/tests/kernels/test_fused_indexer_q_rope_quant.py
+index e655d8442..104dbf64a 100644
+--- a/tests/kernels/test_fused_indexer_q_rope_quant.py
++++ b/tests/kernels/test_fused_indexer_q_rope_quant.py
+@@ -170,23 +170,6 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
+     q_quant_ref, weights_ref = _reference(
+         positions, q, cos_sin_cache, weights, softmax_scale, head_scale, use_fp4
+     )
+-    output_buffers: tuple[torch.Tensor, ...] | None = None
+-    OUTPUT_BUFFER_TEST_NUM_TOKENS = 7
+-    if num_tokens == OUTPUT_BUFFER_TEST_NUM_TOKENS and cache_dtype == torch.float32:
+-        if use_fp4:
+-            q_ref, q_scale_ref = q_quant_ref
+-            output_buffers = (
+-                torch.empty_like(q_ref),
+-                torch.empty_like(q_scale_ref)
+-                .view(torch.uint8)
+-                .reshape(num_tokens, N_HEAD, -1),
+-                torch.empty_like(weights_ref),
+-            )
+-        else:
+-            output_buffers = (
+-                torch.empty_like(q_quant_ref),
+-                torch.empty_like(weights_ref),
+-            )
+     # use_cutedsl=False: force the triton path even when cutedsl is usable, by
+     # patching the binding the dispatcher actually calls (fused_indexer_q.py
+     # imports `is_cutedsl_supported`, and never bound `has_cutedsl`).
+@@ -207,17 +190,8 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
+             softmax_scale,
+             head_scale,
+             use_fp4,
+-            output_buffers=output_buffers,
+         )
+ 
+-    if output_buffers is not None:
+-        if use_fp4:
+-            assert q_quant_fused[0].data_ptr() == output_buffers[0].data_ptr()
+-            assert q_quant_fused[1].data_ptr() == output_buffers[1].data_ptr()
+-        else:
+-            assert q_quant_fused.data_ptr() == output_buffers[0].data_ptr()
+-        assert weights_fused.data_ptr() == output_buffers[-1].data_ptr()
+-
+     if use_fp4:
+         q_quant_ref, q_scale_ref = q_quant_ref
+         q_quant_fused, q_scale_fused = q_quant_fused
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index 8c215adf5..7c03c9e3c 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -33,7 +33,6 @@ from vllm.models.deepseek_v4.common.ops import (
+ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+ 
+ if TYPE_CHECKING:
+-    from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
+     from vllm.v1.attention.backends.mla.sparse_swa import (
+         DeepseekSparseSWAMetadata,
+     )
+@@ -187,7 +186,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         prefix: str,
+         topk_indices_buffer: torch.Tensor | None = None,
+         aux_stream_list: list[torch.cuda.Stream] | None = None,
+-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
+     ) -> None:
+         super().__init__()
+         config = vllm_config.model_config.hf_config
+@@ -276,7 +274,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         )
+         self.indexer_rotary_emb = self.rotary_emb
+         self.topk_indices_buffer = topk_indices_buffer
+-        self.eager_scratch_pool = eager_scratch_pool
+ 
+         self.indexer = None
+         if self.compress_ratio == 4:
+@@ -298,7 +295,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+                 compress_ratio=self.compress_ratio,
+                 prefix=f"{prefix}.indexer",
+                 aux_stream=indexer_aux_stream,
+-                eager_scratch_pool=eager_scratch_pool,
+             )
+ 
+         # Will be None on ROCm for now.
+@@ -349,7 +345,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+                 rotate=True,
+                 prefix=f"{prefix}.compressor",
+                 k_cache_prefix=self.prefix,
+-                eager_scratch_pool=eager_scratch_pool,
+             )
+ 
+         # Built after weight loading by `fuse_input_gemm_weights`; see there.
+@@ -674,24 +669,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         if cache_dtype == torch.uint8:
+             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
+             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
+-            #            the padding head slots.
++            #            the padding head slots; the kernel allocates and returns
++            #            the padded q tensor.
+             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
+             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+-            if self.eager_scratch_pool is not None:
+-                q_out = self.eager_scratch_pool.q_out(q.shape[0])
+-                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+-                    q,
+-                    kv,
+-                    q_out,
+-                    swa_kv_cache_2d,
+-                    swa_metadata.slot_mapping,
+-                    positions,
+-                    cos_sin_cache,
+-                    self.padded_heads,
+-                    self.eps,
+-                    swa_metadata.block_size,
+-                )
+-                return q_out
+             return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                 q,
+                 kv,
+@@ -740,13 +721,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         )
+         return q_fp8
+ 
+-    def _global_topk_output_buffers(
+-        self, topk_indices: torch.Tensor
+-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+-        if self.compress_ratio != 4 or self.eager_scratch_pool is None:
+-            return None
+-        return self.eager_scratch_pool.global_topk_outputs(topk_indices)
+-
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return self.backend_cls
+ 
+@@ -826,7 +800,6 @@ class DeepseekV4Indexer(nn.Module):
+         compress_ratio: int = 1,
+         prefix: str = "",
+         aux_stream: torch.cuda.Stream | None = None,
+-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
+     ):
+         super().__init__()
+         self.vllm_config = vllm_config
+@@ -839,7 +812,6 @@ class DeepseekV4Indexer(nn.Module):
+         self.rope_dim = config.qk_rope_head_dim  # 64
+         self.q_lora_rank = q_lora_rank  # 1024
+         self.compress_ratio = compress_ratio
+-        self.eager_scratch_pool = eager_scratch_pool
+         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+         logger.info_once(
+             "Using %s indexer cache for Lightning Indexer.",
+@@ -903,7 +875,6 @@ class DeepseekV4Indexer(nn.Module):
+             prefix=f"{prefix}.compressor",
+             k_cache_prefix=self.k_cache.prefix,
+             use_fp4_cache=self.use_fp4_kv,
+-            eager_scratch_pool=eager_scratch_pool,
+         )
+ 
+         self.indexer_op = SparseAttnIndexer(
+@@ -941,7 +912,10 @@ class DeepseekV4Indexer(nn.Module):
+         attn_metadata = get_forward_context().attn_metadata
+         if isinstance(attn_metadata, dict):
+             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
++            if (
++                indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
++                and not torch.cuda.is_current_stream_capturing()
++            ):
+                 # candidates num smaller than topk, every candidate is selected
+                 # but we still need to build k cache
+                 compressor(compressed_kv_score, positions, rotary_emb)
+@@ -965,9 +939,6 @@ class DeepseekV4Indexer(nn.Module):
+             # ReplicatedLinear returns (output, bias); bias is None.
+             q, _ = self.wq_b(qr)
+             q = q.view(-1, self.n_head, self.head_dim)
+-            outputs = None
+-            if self.eager_scratch_pool is not None and self.use_fp4_kv:
+-                outputs = self.eager_scratch_pool.indexer_q_outputs(q.shape[0])
+             return fused_indexer_q_rope_quant(
+                 positions,
+                 q,
+@@ -976,7 +947,6 @@ class DeepseekV4Indexer(nn.Module):
+                 self.softmax_scale,
+                 self.n_head**-0.5,
+                 use_fp4=self.use_fp4_kv,
+-                output_buffers=outputs,
+             )
+ 
+         # compressor returns None and writes K to the indexer KV cache; the
+diff --git a/vllm/models/deepseek_v4/common/ops/cache_utils.py b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+index bdd2340c3..c44e6157c 100644
+--- a/vllm/models/deepseek_v4/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+@@ -431,7 +431,6 @@ def compute_global_topk_indices_and_lens(
+     block_table: torch.Tensor,
+     block_size: int,
+     is_valid_token: torch.Tensor,
+-    output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Map local topk indices to global KV cache slots and count valid entries.
+ 
+@@ -441,15 +440,8 @@ def compute_global_topk_indices_and_lens(
+     3. Masking padding tokens to length 0
+     """
+     num_tokens = topk_indices.shape[0]
+-    if output_buffers is None:
+-        global_topk_indices = torch.empty_like(topk_indices)
+-        topk_lens = torch.empty(
+-            num_tokens, dtype=torch.int32, device=topk_indices.device
+-        )
+-    else:
+-        global_topk_indices, topk_lens = output_buffers
+-        assert global_topk_indices.shape == topk_indices.shape
+-        assert topk_lens.shape == (num_tokens,)
++    global_topk_indices = torch.empty_like(topk_indices)
++    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
+         global_topk_indices,
+         global_topk_indices.stride(0),
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+index 67a6a86f9..7c35b46c4 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+@@ -295,7 +295,6 @@ def fused_indexer_q_rope_quant(
+     index_weights_softmax_scale: float,
+     index_weights_head_scale: float,
+     use_fp4: bool = False,
+-    output_buffers: tuple[torch.Tensor, ...] | None = None,
+ ) -> tuple[
+     torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+     torch.Tensor,
+@@ -333,13 +332,7 @@ def fused_indexer_q_rope_quant(
+     num_index_q_heads = index_q.shape[1]
+     index_q_head_dim = index_q.shape[2]
+ 
+-    if output_buffers is None:
+-        index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+-    else:
+-        expected_num_buffers = 3 if use_fp4 else 2
+-        assert len(output_buffers) == expected_num_buffers
+-        index_weights_out = output_buffers[-1]
+-        assert index_weights_out.shape == index_weights.shape
++    index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+ 
+     if use_fp4:
+         assert index_q_head_dim % MXFP4_BLOCK_SIZE == 0, (
+@@ -347,23 +340,16 @@ def fused_indexer_q_rope_quant(
+             f"size {MXFP4_BLOCK_SIZE}"
+         )
+         num_scale_blocks = index_q_head_dim // MXFP4_BLOCK_SIZE
+-        packed_shape = (num_tokens, num_index_q_heads, index_q_head_dim // 2)
+-        scale_shape = (num_tokens, num_index_q_heads, num_scale_blocks)
+-        if output_buffers is None:
+-            index_q_packed = torch.empty(
+-                packed_shape,
+-                dtype=torch.uint8,
+-                device=index_q.device,
+-            )
+-            index_q_scale = torch.empty(
+-                scale_shape,
+-                dtype=torch.uint8,
+-                device=index_q.device,
+-            )
+-        else:
+-            index_q_packed, index_q_scale, _ = output_buffers
+-        assert index_q_packed.shape == packed_shape
+-        assert index_q_scale.shape == scale_shape
++        index_q_packed = torch.empty(
++            (num_tokens, num_index_q_heads, index_q_head_dim // 2),
++            dtype=torch.uint8,
++            device=index_q.device,
++        )
++        index_q_scale = torch.empty(
++            (num_tokens, num_index_q_heads, num_scale_blocks),
++            dtype=torch.uint8,
++            device=index_q.device,
++        )
+         if is_cutedsl_supported():
+             # lazily import, otherwise some tests fail due to CUDA driver init failure.
+             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+@@ -432,11 +418,7 @@ def fused_indexer_q_rope_quant(
+     fp8_dtype = current_platform.fp8_dtype()
+     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
+     fp8_max = 224.0 if use_fnuz else 448.0
+-    if output_buffers is None:
+-        index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
+-    else:
+-        index_q_fp8, _ = output_buffers
+-        assert index_q_fp8.shape == index_q.shape
++    index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
+     if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+diff --git a/vllm/models/deepseek_v4/compressor.py b/vllm/models/deepseek_v4/compressor.py
+index 887377989..4e328414a 100644
+--- a/vllm/models/deepseek_v4/compressor.py
++++ b/vllm/models/deepseek_v4/compressor.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Any, ClassVar, cast
++from typing import Any, ClassVar, cast
+ 
+ import torch
+ from torch import nn
+@@ -36,9 +36,6 @@ from vllm.v1.kv_cache_interface import (
+     SlidingWindowMLASpec,
+ )
+ 
+-if TYPE_CHECKING:
+-    from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
+-
+ 
+ def _prefer_two_stage_compressor() -> bool:
+     # Platforms that favor the triton variant of two-stage compressor split.
+@@ -230,7 +227,6 @@ class DeepseekCompressor(nn.Module):
+         prefix: str = "",
+         k_cache_prefix="",
+         use_fp4_cache: bool = False,
+-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
+     ):
+         super().__init__()
+         self.compress_ratio = compress_ratio
+@@ -240,7 +236,6 @@ class DeepseekCompressor(nn.Module):
+         self.prefix = prefix
+         self.k_cache_prefix = k_cache_prefix
+         self.use_fp4_cache = use_fp4_cache
+-        self.eager_scratch_pool = eager_scratch_pool
+ 
+         config = vllm_config.model_config.hf_config
+         self.rope_head_dim = config.qk_rope_head_dim
+@@ -435,10 +430,6 @@ class DeepseekCompressor(nn.Module):
+                 store_full_fp8=store_full_fp8,
+                 fp8_scale=fp8_scale,
+             )
+-            if not self.overlap and self.eager_scratch_pool is not None:
+-                extra_kwargs["compress_scratch"] = (
+-                    self.eager_scratch_pool.compressor_scratch(num_actual)
+-                )
+         elif self._use_two_stage_fused_compressor:
+             # head=512 cr>=128 (no overlap): two-pass split compressor on the
+             # prefill suffix, single-pass on the decode prefix.
+diff --git a/vllm/models/deepseek_v4/eager_scratch.py b/vllm/models/deepseek_v4/eager_scratch.py
+deleted file mode 100644
+index bc46239bf..000000000
+--- a/vllm/models/deepseek_v4/eager_scratch.py
++++ /dev/null
+@@ -1,137 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-from math import prod
+-
+-import torch
+-
+-from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+-from vllm.utils.math_utils import round_up
+-
+-
+-class DeepseekV4EagerScratchPool:
+-    """Model-wide outputs and scratch used inside the attention eager break."""
+-
+-    _ALIGNMENT = 256
+-
+-    def __init__(
+-        self,
+-        max_num_tokens: int,
+-        padded_q_heads: int,
+-        q_head_dim: int,
+-        index_q_heads: int,
+-        index_q_head_dim: int,
+-        index_topk: int,
+-        device: torch.device | str,
+-    ) -> None:
+-        self.max_num_tokens = max_num_tokens
+-        self.index_topk = index_topk
+-        self._q = torch.empty(
+-            (max_num_tokens, padded_q_heads, q_head_dim),
+-            dtype=torch.bfloat16,
+-            device=device,
+-        )
+-
+-        fp4_specs = (
+-            ((max_num_tokens, index_q_heads, index_q_head_dim // 2), torch.uint8),
+-            (
+-                (
+-                    max_num_tokens,
+-                    index_q_heads,
+-                    index_q_head_dim // MXFP4_BLOCK_SIZE,
+-                ),
+-                torch.uint8,
+-            ),
+-            ((max_num_tokens, index_q_heads), torch.float32),
+-        )
+-        global_specs = (
+-            ((max_num_tokens, index_topk), torch.int32),
+-            ((max_num_tokens,), torch.int32),
+-        )
+-        compressor_specs = (((max_num_tokens, q_head_dim), torch.float32),)
+-        # FP4 indexer is C4 only, global mapping after FP4 indexer
+-        # compressor scratch is C128 only
+-        # so here we use max instead of sum
+-        aux_bytes = max(
+-            self._packed_size(specs)
+-            for specs in (fp4_specs, global_specs, compressor_specs)
+-        )
+-        storage = torch.empty(aux_bytes, dtype=torch.uint8, device=device)
+-
+-        self._q_outputs: dict[int, torch.Tensor] = {}
+-        fp4_values, fp4_scales, fp4_weights = self._views(storage, fp4_specs)
+-        self._fp4_template = (fp4_values, fp4_scales, fp4_weights)
+-        self._fp4_outputs: dict[
+-            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+-        ] = {}
+-        global_indices, global_lens = self._views(storage, global_specs)
+-        self._global_template = (global_indices, global_lens)
+-        self._global_outputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+-        self._compressor_template = self._views(storage, compressor_specs)[0]
+-        self._compressor_outputs: dict[int, torch.Tensor] = {}
+-        self._storage = storage
+-
+-    @classmethod
+-    def _packed_size(
+-        cls, specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]
+-    ) -> int:
+-        offset = 0
+-        for shape, dtype in specs:
+-            offset = round_up(offset, cls._ALIGNMENT) + prod(shape) * dtype.itemsize
+-        return round_up(offset, cls._ALIGNMENT)
+-
+-    @classmethod
+-    def _views(
+-        cls,
+-        storage: torch.Tensor,
+-        specs: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+-    ) -> list[torch.Tensor]:
+-        offset = 0
+-        views = []
+-        for shape, dtype in specs:
+-            offset = round_up(offset, cls._ALIGNMENT)
+-            num_bytes = prod(shape) * dtype.itemsize
+-            views.append(storage[offset : offset + num_bytes].view(dtype).view(shape))
+-            offset += num_bytes
+-        return views
+-
+-    def q_out(self, num_tokens: int) -> torch.Tensor:
+-        output = self._q_outputs.get(num_tokens)
+-        if output is None:
+-            output = self._q[:num_tokens]
+-            self._q_outputs[num_tokens] = output
+-        return output
+-
+-    def compressor_scratch(self, num_tokens: int) -> torch.Tensor:
+-        output = self._compressor_outputs.get(num_tokens)
+-        if output is None:
+-            output = self._compressor_template[:num_tokens]
+-            self._compressor_outputs[num_tokens] = output
+-        return output
+-
+-    def indexer_q_outputs(
+-        self,
+-        num_tokens: int,
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        output = self._fp4_outputs.get(num_tokens)
+-        if output is None:
+-            values, scales, weights = self._fp4_template
+-            output = (
+-                values[:num_tokens],
+-                scales[:num_tokens],
+-                weights[:num_tokens],
+-            )
+-            self._fp4_outputs[num_tokens] = output
+-        return output
+-
+-    def global_topk_outputs(
+-        self, topk_indices: torch.Tensor
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
+-        num_tokens, topk = topk_indices.shape
+-        assert topk == self.index_topk
+-        output = self._global_outputs.get(num_tokens)
+-        if output is None:
+-            indices, lens = self._global_template
+-            output = (indices[:num_tokens], lens[:num_tokens])
+-            self._global_outputs[num_tokens] = output
+-        return output
+diff --git a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+index d8742e610..19810f466 100644
+--- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+@@ -745,9 +745,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+                         attn_metadata.block_table[:num_decodes],
+                         block_size,
+                         is_valid,
+-                        output_buffers=self._global_topk_output_buffers(
+-                            self.topk_indices_buffer[:num_decode_tokens]
+-                        ),
+                     )
+                 )
+                 extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
+@@ -837,7 +834,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+                     attn_metadata.block_table,
+                     block_size,
+                     swa_metadata.is_valid_token[prefill_token_slice],
+-                    output_buffers=self._global_topk_output_buffers(local_topk_indices),
+                 )
+             )
+ 
+diff --git a/vllm/models/deepseek_v4/nvidia/flashmla.py b/vllm/models/deepseek_v4/nvidia/flashmla.py
+index 29ec2d6f2..3169ccfce 100644
+--- a/vllm/models/deepseek_v4/nvidia/flashmla.py
++++ b/vllm/models/deepseek_v4/nvidia/flashmla.py
+@@ -176,9 +176,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+                     attn_metadata.block_table[:num_decodes],
+                     block_size,
+                     is_valid,
+-                    output_buffers=self._global_topk_output_buffers(
+-                        self.topk_indices_buffer[:num_decode_tokens]
+-                    ),
+                 )
+                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
+             else:
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index d05b7e65b..ebf6886c4 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -66,7 +66,6 @@ from vllm.model_executor.models.utils import (
+ )
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+-from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
+ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+     DeepseekV4FlashInferMLAAttention,
+     DeepseekV4FlashInferSM120Attention,
+@@ -817,7 +816,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+         prefix,
+         topk_indices_buffer: torch.Tensor | None = None,
+         aux_stream_list: list[torch.cuda.Stream] | None = None,
+-        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
+     ):
+         super().__init__()
+ 
+@@ -830,7 +828,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+             prefix=f"{prefix}.attn",
+             topk_indices_buffer=topk_indices_buffer,
+             aux_stream_list=aux_stream_list,
+-            eager_scratch_pool=eager_scratch_pool,
+         )
+         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+ 
+@@ -1007,22 +1004,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # (compressor kv_score, indexer.weights_proj, indexer.compressor
+         # kv_score). fused_wqa_wkv stays on the default stream.
+         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+-        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
+-            config.num_attention_heads // get_tensor_model_parallel_world_size()
+-        )
+-        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
+-        if not vllm_config.parallel_config.use_ubatching:
+-            # TODO: support dbo if needed
+-            # this requires the buffer to have ubatch dim
+-            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
+-                vllm_config.scheduler_config.max_num_batched_tokens,
+-                padded_heads,
+-                config.head_dim,
+-                config.index_n_heads,
+-                config.index_head_dim,
+-                config.index_topk,
+-                current_platform.device_type,
+-            )
+ 
+         # Reserved topk indices buffer for all Indexer layers to reuse.
+         self.topk_indices_buffer = torch.empty(
+@@ -1048,7 +1029,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 prefix=prefix,
+                 topk_indices_buffer=self.topk_indices_buffer,
+                 aux_stream_list=aux_stream_list,
+-                eager_scratch_pool=self.eager_scratch_pool,
+             ),
+             prefix=f"{prefix}.layers",
+         )
+diff --git a/vllm/models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py b/vllm/models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py
+index 960c516c4..4ff4b232d 100644
+--- a/vllm/models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py
+@@ -2097,7 +2097,6 @@ def compress_norm_rope_store_cutedsl(
+     store_full_kv: bool = False,
+     store_full_fp8: bool = False,
+     fp8_scale: torch.Tensor | None = None,
+-    compress_scratch: torch.Tensor | None = None,
+ ) -> None:
+     if compress_ratio == 4:
+         # For C4A, the single fused kernel is faster than the two-kernel version.
+@@ -2130,15 +2129,11 @@ def compress_norm_rope_store_cutedsl(
+         )
+     else:
+         # For C128, the two-kernel version is faster than the single fused kernel.
+-        if compress_scratch is None:
+-            compressed_kv = torch.empty(
+-                (num_actual, head_dim),
+-                dtype=torch.float32,
+-                device=state_cache.device,
+-            )
+-        else:
+-            assert compress_scratch.shape == (num_actual, head_dim)
+-            compressed_kv = compress_scratch
++        compressed_kv = torch.empty(
++            (num_actual, head_dim),
++            dtype=torch.float32,
++            device=state_cache.device,
++        )
+         split_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
+             state_cache,
+             token_to_req_indices,

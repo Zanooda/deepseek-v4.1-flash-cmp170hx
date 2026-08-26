@@ -69,22 +69,34 @@ This repo sits on top of that branch.
 ## Quick start
 
 ```bash
-git clone --branch dsv4-flash-a100 --single-branch \
-    https://github.com/haosdent/vllm.git
-cd vllm
+# Easiest: pull the prebuilt c3046d1 image (patches 0002-0008 baked in)
+docker pull zanooda/vllm-sm80:c3046d1
+docker tag zanooda/vllm-sm80:c3046d1 dsv4-a100:devel
 
-# The branch was force-pushed after these patches were written, so the tip no
-# longer matches. f8ea5bb is NOT reachable from the branch any more, a --depth
-# clone will not contain it, and the server REFUSES fetch-by-SHA. Fetching all
-# refs is what makes it reachable:
-git fetch origin '+refs/*:refs/remotes/all/*'
-git checkout f8ea5bb
+deepseek-v4-cmp170hx/launch/run-pp-dspark.sh   # sources default to ~/vllm/vllm
+```
 
-for p in ../deepseek-v4-cmp170hx/patches/*.patch; do patch -p1 < "$p"; done
+Building it yourself instead — note the base is `c3046d1`, which touches `csrc/`, so this is a
+**full CUDA source build (~2-4 h, needs >= 48 GB RAM)**; the old 10-minute `Dockerfile.devel`
+flow cannot deliver the kernel changes. There is also a self-contained remote-build script
+([docker/vastai-build-push.sh](docker/vastai-build-push.sh)) that does all of the below and
+pushes to a registry:
 
-cp ../deepseek-v4-cmp170hx/docker/Dockerfile.devel .
-cp ../deepseek-v4-cmp170hx/docker/dockerignore.txt .dockerignore
-docker build -f Dockerfile.devel -t dsv4-a100:devel .    # ~10 min, mostly download
+```bash
+git clone https://github.com/haosdent/vllm.git && cd vllm
+
+# c3046d1 is NOT reachable by any git method (force-pushed, referenced by nothing).
+# Reconstruct it from the tarball and verify the tree SHA -- full procedure and
+# the safety story in patches/README.md:
+curl -sL -o /tmp/c3046d1.tar.gz \
+  https://codeload.github.com/haosdent/vllm/tar.gz/c3046d1ebd2dae9b94ad2ef5f966ea153632251e
+# ... reconstruct + verify per patches/README.md, then:
+git checkout -B rebase-c3046d1 c3046d1-recon
+
+# patches 0002 -> 0008 (0001 is dropped -- its gate is upstream in c3046d1)
+for p in ../deepseek-v4-cmp170hx/patches/000{2,3,4,5,5a,6,7,8}*.patch; do patch -p1 < "$p"; done
+
+docker build -f ../deepseek-v4-cmp170hx/docker/Dockerfile.fullbuild -t dsv4-a100:devel .
 
 ../deepseek-v4-cmp170hx/launch/run-pp-dspark.sh
 ```
@@ -95,11 +107,15 @@ Two build traps worth knowing before you start:
   a build rooted there will try to ship hundreds of GB to the Docker daemon as build context.
 - **The base image needs a real CUDA toolkit.** `python:3.12-slim` plus pip CUDA wheels gives
   `nvcc` 13.3 against FlashInfer's bundled headers for 13.0, and FlashInfer's JIT is a hard
-  requirement at engine init. `Dockerfile.devel` uses `nvidia/cuda:13.0.2-cudnn-devel` with a
-  venv, which is why it works.
+  requirement at engine init. Both Dockerfiles use `nvidia/cuda:13.0.2-cudnn-devel` with a
+  venv, which is why they work.
+- **RAM.** The full build OOMs on 30 GB even at `MAX_JOBS=16`; it is capped at 8 for a
+  reason. Give it >= 48 GB or add swap before raising it.
 
-The branch's SM8x commit touches only Python and Triton — no `csrc/`, no CMake — so
-`VLLM_USE_PRECOMPILED=1` turns what would be a multi-hour CUDA build into a download.
+On the *old* `f8ea5bb` base the SM8x work was Python/Triton-only, so `Dockerfile.devel`
+(`VLLM_USE_PRECOMPILED=1`) turned the build into a ~10-minute download. That no longer
+holds on `c3046d1`: the base itself changes `csrc/`, and precompiled wheels physically
+cannot contain those kernels.
 
 ---
 
@@ -203,8 +219,9 @@ driven gains you nothing and risks damaging the contact.
 ## Repo layout
 
 ```
-patches/     7 patches against haosdent/vllm@dsv4-flash-a100 (f8ea5bb) — see patches/README.md
-docker/      container build (CUDA-devel base + venv, precompiled vLLM wheel)
+patches/     8 patches (0002-0008 on c3046d1; 0001 only on the legacy f8ea5bb base) — see patches/README.md
+docker/      Dockerfile.fullbuild (source build, c3046d1), Dockerfile.devel (precompiled, f8ea5bb-era),
+             vastai-build-push.sh (remote build + registry push)
 launch/      run-pp-dspark.sh (best config) and run-a100.sh (tensor-parallel variant)
 bench/       the 8 harnesses every number in RESULTS.md came from
 SETTINGS.md  every flag and why it has that value
