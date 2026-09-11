@@ -133,7 +133,7 @@ two cache block sizes. Kernel time (64 heads × 128): prefill 64 rows × 131k 2.
 decode 48 rows × 131k 2.4 → 0.32 ms, 8 rows × 1M 3.0 → 0.16 ms. In the engine the KV pool
 grew from 2,827,499 to 3,151,289 tokens (profiling no longer sees the full-width transient);
 needles 13/13 after the change. Decode-step impact is small because the indexer was a
-smaller slice of the step than estimated — numbers in [RESULTS](../RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+smaller slice of the step than estimated — numbers in [RESULTS](../RESULTS.md).
 
 ### What was verified, and what was not
 
@@ -146,7 +146,7 @@ sm_80 kernels). **Running on the 8× CMP 170HX box since 2026-09-10 22:26 UTC** 
 Engram from disk, partition 5×8): chat coherence 5/5 (factual, arithmetic, code,
 multi-turn memory, tool call), needles **19/19** — depths 10/50/90 % at 4k, 32k, 128k,
 512k and 1M (820k real tokens), plus 4 concurrent 32k needles with distinct passphrases
-and no cross-request bleed. Speeds in [RESULTS](../RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+and no cross-request bleed. Speeds in [RESULTS](../RESULTS.md).
 
 ---
 
@@ -155,7 +155,7 @@ and no cross-request bleed. Speeds in [RESULTS](../RESULTS.md#deepseek-v41-flash
 Upstream's 41-commit serving-optimization campaign (base
 `f8ea5bb` → `c3046d1ebd2dae9b94ad2ef5f966ea153632251e`, 2026-08-04) is worth a measured
 **+7% decode (p<0.001)** on this hardware with correctness intact — see
-[RESULTS](../RESULTS.md#rebase-to-c3046d1-2026-08-13), including why the "+30%" you may
+the V4 results (removed from RESULTS.md, which now covers V4.1 only), including why the "+30%" you may
 have seen claimed for this range does not survive a paired A/B.
 
 On `c3046d1`:
@@ -230,7 +230,7 @@ rebuilding — which is what [`launch/run-pp-dspark.sh`](../launch/run-pp-dspark
 
 | # | file | what | why |
 |---|---|---|---|
-| 0001 | `model_executor/layers/sparse_attn_indexer.py` | add the missing `has_device_capability(90)` gate to `use_persistent_topk` | ⚠️ **Precautionary — the failure it guards against does NOT reproduce on this branch.** The original report (another CMP 170HX owner, vllm#50576) was that sm_80 selects a radix top-k returning wrong indices when the candidate count falls between k and 2k — prompt length 2049–4096 at `index_topk=512`/`compress_ratio=4` — emitting fluent-looking degenerate text. **That reporter has since retracted it for `dsv4-flash-a100`, and we could not reproduce it either.** We kept the patch because it costs nothing; see [RESULTS](../RESULTS.md#-patch-0001-is-precautionary-not-a-fix-for-an-observed-bug). |
+| 0001 | `model_executor/layers/sparse_attn_indexer.py` | add the missing `has_device_capability(90)` gate to `use_persistent_topk` | ⚠️ **Precautionary — the failure it guards against does NOT reproduce on this branch.** The original report (another CMP 170HX owner, vllm#50576) was that sm_80 selects a radix top-k returning wrong indices when the candidate count falls between k and 2k — prompt length 2049–4096 at `index_topk=512`/`compress_ratio=4` — emitting fluent-looking degenerate text. **That reporter has since retracted it for `dsv4-flash-a100`, and we could not reproduce it either.** We kept the patch because it costs nothing; see the V4 results (removed from RESULTS.md, which now covers V4.1 only). |
 | 0002 | `config/speculative.py` | `draft_parallel_config.pipeline_parallel_size = 1` for dspark | The DSpark draft is **not** pipelined — the model runner builds it on the last PP rank only and it runs there whole. Inheriting the target's PP size makes `verify_with_parallel_config` demand `SupportsPP` from the *draft* architecture, which it neither implements nor needs. |
 | 0003 | `v1/worker/gpu/pp_utils.py` | add `broadcast_draft()`, the matching receive, and sampled-token padding | This is **vLLM PR #46994**, which is not in upstream main. Without it, non-last pipeline ranks verify against a zero-initialised `req_states.draft_tokens` — acceptance near zero and corrupt output. The padding matters too: the receiver always posts a `max_sample_len`-wide buffer, so an unpadded narrow send is an element-count mismatch that deadlocks. |
 | 0004 | `v1/worker/gpu/model_runner.py` | drop the dspark PP guard; call `broadcast_draft()` after `propose()`; scatter relayed draft tokens on non-last ranks | The guard covered eagle3/dflash/dspark; only dspark is enabled here — the other two are untested and their aux layers are spread across ranks rather than landing on one. |

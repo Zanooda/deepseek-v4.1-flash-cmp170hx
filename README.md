@@ -1,27 +1,28 @@
 # DeepSeek-V4 and V4.1 Flash on CMP 170HX mining cards
 
 vLLM patches, container builds, launch scripts and benchmark harnesses for
-**DeepSeek-V4.1-Flash** on eight and **DeepSeek-V4-Flash-0731** on four 64 GB
-**CMP 170HX** (sm_80, PCIe Gen2 x4). Every number below was measured on that hardware.
+**DeepSeek-V4.1-Flash** on eight 64 GB **CMP 170HX** (sm_80, PCIe Gen2 x4). Every number
+below was measured on that hardware.
 
-| | DeepSeek-V4.1-Flash, 8 cards | DeepSeek-V4-Flash-0731, 4 cards |
-|---|---|---|
-| decode, one stream | **117 tok/s** at 128k, 96 at 512k (text-dependent, see below) | **98 tok/s** |
-| decode, 8 streams together | **532 tok/s** aggregate at 128k (66 per stream) | 713 tok/s at 64 streams |
-| prefill, one stream | **6,066 tok/s** at 105k tokens (time to first token 17 s) | ~5,300 tok/s |
-| longest verified prompt | 1,007,820 tokens (the model's full 1M) | 1,047,736 tokens |
-| KV pool | 6.17M tokens, 5.9 concurrent 1M requests | |
-| speculative decoding | DSpark, up to 6 tokens per step | DSpark, 1.93× |
+| | DeepSeek-V4.1-Flash on 8× CMP 170HX |
+|---|---|
+| decode, one stream | **117 tok/s** at 128k, 96 at 512k (text-dependent, see [RESULTS](RESULTS.md#3-decode-single-stream)) |
+| decode, 8 streams together | **532 tok/s** aggregate at 128k (66 per stream) |
+| prefill, one stream | **6,066 tok/s** at 105k tokens (time to first token 17 s) |
+| concurrent prefill | ~6,900 tok/s aggregate, all cards at 92–96 % |
+| longest verified prompt | 1,007,820 tokens (the model's full 1M) |
+| KV pool | 6.17M tokens, 5.9 concurrent 1M requests |
+| speculative decoding | DSpark, up to 6 tokens per step |
 
 This repository is based on the work in
 [allover326/deepseek-v4-cmp170hx](https://github.com/allover326/deepseek-v4-cmp170hx),
-which produced the DeepSeek-V4 stack, the V4 patch series and the V4 measurements below;
-the DeepSeek-V4.1 series and its results were added on top. Both stacks build on
+which produced the DeepSeek-V4-Flash stack this builds on (the V4 patch series is still
+in `patches/`, its notes in `patches/README.md`); the V4.1 series and all results here
+were added on top. Both stacks build on
 [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100),
 the sm_80 DeepSeek-V4 backend (see [vllm#50576](https://github.com/vllm-project/vllm/issues/50576)).
 Deep dives: [SETTINGS.md](SETTINGS.md) (every flag and why), [RESULTS.md](RESULTS.md)
-(all measurements, including what does not work), [patches/README.md](patches/README.md)
-(patch-by-patch notes and the base-commit recovery procedures).
+(all measurements), [patches/README.md](patches/README.md) (patch-by-patch notes).
 
 ---
 
@@ -62,7 +63,7 @@ clones vLLM, checks out the PR head, applies `patches/v41/`, verifies both tree 
 builds `Dockerfile.fullbuild` for sm_80) and set `DSV41_IMG_COMMIT` to that image's commit
 so the mount list becomes empty.
 
-Defaults in the launch script (all measured, see [SETTINGS.md](SETTINGS.md#deepseek-v41-flash-launchrun-v41-pp8sh)):
+Defaults in the launch script (all measured, see [SETTINGS.md](SETTINGS.md)):
 PP=8 with `VLLM_PP_LAYER_PARTITION=5,5,5,5,5,5,5,5`, `--max-model-len 1048576`,
 `--gpu-memory-utilization 0.95`, `--block-size 128`, `--max-num-batched-tokens 4096`,
 `--max-num-seqs 8`, fp8 KV, `--engram-config '{"storage":"cpu"}'`, DSpark with 5 draft
@@ -94,7 +95,7 @@ in [patches/README.md](patches/README.md#-2026-09-10-deepseek-v41-flash-series--
 
 All numbers: 8× CMP 170HX, PP=8 as launched above, word-salad prompts of unique content,
 greedy decoding, prefix cache cold unless noted. Raw data in `bench/*.jsonl`; tables and
-caveats in [RESULTS.md](RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+caveats in [RESULTS.md](RESULTS.md).
 
 **Prefill, one stream** (time to first token, prompt tokens / TTFT):
 
@@ -158,76 +159,10 @@ hits.
 
 ---
 
-## DeepSeek-V4-Flash-0731 on 4 cards
-
-PP=4 with DSpark speculative decoding, verified to the model's full 1,047,736-token context.
-
-### Quick start (V4)
-
-```bash
-docker pull zanooda/vllm-sm80:c3046d1          # patches 0002-0008 baked in
-docker tag zanooda/vllm-sm80:c3046d1 dsv4-a100:devel
-launch/run-pp-dspark.sh                         # sources default to ~/vllm/vllm
-```
-
-Building yourself means a full CUDA source build (2–4 h, ≥ 48 GB RAM) of the fork at
-`c3046d1` plus `patches/0002`–`0009`; `c3046d1` was force-pushed away and is only recoverable
-by tarball, procedure in [patches/README.md](patches/README.md#getting-c3046d1--it-is-unreachable-by-any-git-method).
-`docker/vastai-build-push.sh` does the whole thing on a rented box. Three cards also work
-with `VLLM_PP_LAYER_PARTITION=15,15,13`; two cannot hold the weights.
-
-### The V4 patch series
-
-| # | file | what it does |
-|---|---|---|
-| 0001 | `sparse_attn_indexer.py` | `has_device_capability(90)` gate on the persistent top-k (legacy `f8ea5bb` base only; upstream in `c3046d1`) |
-| 0002 | `config/speculative.py` | the DSpark draft runs whole on the last rank: `draft_parallel_config.pipeline_parallel_size = 1` |
-| 0003 | `v1/worker/gpu/pp_utils.py` | `broadcast_draft()` and its receive: relay draft tokens to the ranks that must verify them (vLLM PR #46994) |
-| 0004 | `v1/worker/gpu/model_runner.py` | drop the "no DSpark under PP" guard, call `broadcast_draft()`, scatter relayed tokens |
-| 0005 | `spec_decode/dspark/utils.py` | drop the `NotImplementedError`, load the draft's token embedding from the checkpoint (under PP the target's embedding lives on rank 0) |
-| 0005a | `sparse_attn_indexer.py` | torch fallback for the prefill top-k on sm_8x: the CUDA kernel leaves indices uninitialised above ~128k and crashes with an illegal memory access |
-| 0006 | `sparse_attn_indexer.py` | `DSV4_LOGITS_ROW_CHUNK`: row-chunk the indexer's `[M, N]` fp32 logits transient. **The context-ceiling fix: ~134k → 1,047,736 tokens.** |
-| 0007 | `parser/deepseek_v4.py` + engine | DSML tool-call recovery for missing/corrupted wrappers (vLLM PR #52645, commits 1–4) |
-| 0008 | `rejection_sampler_utils.py` | NaN block maxima → `-inf` before `argmax` (vLLM PR #50183) |
-| 0009 | `models/deepseek_v4/**`, `csrc` | CUDA-graph/indexer corruption fixes (vLLM PRs #52492, #52836): the intermittent token-salad windows across all sessions |
-
-Together, 0002–0005 are what enables **DSpark under pipeline parallelism**, which vLLM
-refuses in three places. It is worth 1.93× on decode and, unlike on tensor parallel where
-speculation turns negative above ~8 streams, keeps winning to 64 concurrent streams.
-
-### V4 benchmarks
-
-| | plain | **+ DSpark** |
-|---|---|---|
-| decode, single stream | 50.8 | **98.1 tok/s** |
-| decode, 64 concurrent | 472.0 | **712.8 tok/s** |
-| decode at 100k context | 38.8 | **90.0 tok/s** |
-| prefill (25k–77k context) | ~5,300 | ~5,200 tok/s |
-| time to first token at 100k | 14.6 s | 14.6 s |
-| time to first token at 1M | | 9.2 min (decode 35.6 tok/s) |
-
-Pipeline parallel beats tensor parallel by 6.6× on prefill here: TP performs 86 all-reduces
-per forward over a Gen2 x4 link with no P2P and measures flat at ~800 tok/s. Full tables:
-[RESULTS.md](RESULTS.md).
-
-### V4 known limits
-
-- **Conversations have a lower ceiling than one-shot prompts.** At `DSV4_LOGITS_ROW_CHUNK=128`
-  a one-shot prefill reaches 1,047,736 tokens but a multi-turn chat dies at ~718–733k; at `64`
-  a 405-turn chat reached 1,002,852 clean. Use 64 for conversational workloads.
-- **Retrieval accuracy degrades with depth**: 100 % at 150k, 87 % at 300k, 60 % at 450k,
-  50 % at 750k, 30 % at 900k. `index_topk` is a fixed 512 while the candidate pool grows;
-  treat 1M as a large working set, not a database. Thinking recovers part of it
-  (61 → 81 % at depth), the effort level does not.
-- **DSpark output is not reproducible at temperature 0**, a property of DSpark itself.
-- **Never use `--enforce-eager`**: 8–10 tok/s.
-
----
-
 ## Troubleshooting: cards running 4× slow (PWRBRK#)
 
-Some boards (the ASUS Pro WS WRX80E-SAGE used for the V4 numbers) assert `PWRBRK#` on edge
-pin **B30** and pin the card at ~88 W, 1140 MHz, a quarter of its fp16 and half its bandwidth.
+Some boards (an ASUS Pro WS WRX80E-SAGE, in earlier work with these cards) assert `PWRBRK#`
+on edge pin **B30** and pin the card at ~88 W, 1140 MHz, a quarter of its fp16 and half its bandwidth.
 
 ```bash
 nvidia-smi -q | grep -A1 "HW Power Brake Slowdown"      # "Active" on an idle card = braked
@@ -241,18 +176,16 @@ B30, or a BIOS/BMC option if the board has one. Do nothing if it reads "Not Acti
 ## Repo layout
 
 ```
-patches/            V4 series 0001-0009 (on haosdent/vllm c3046d1) and patches/README.md
-patches/v41/        V4.1 series 0001-0013 (on vLLM PR #56201 head 79a7108d9a)
-docker/             Dockerfile.fullbuild, Dockerfile.devel, vastai-build-push.sh (V4),
-                    vastai-build-push-v41.sh (V4.1, verifies both tree SHAs)
-launch/             run-pp-dspark.sh (V4), run-a100.sh (V4 TP variant),
-                    run-v41-pp8.sh (V4.1 PP=8), warm-engram-cache.sh (page-cache Engram)
-bench/              every harness behind RESULTS.md: bench_v41_check.py (coherence + needles),
-                    bench_v41_matrix.py (context x concurrency), bench_v41_decode_window.py
-                    (prefill-free concurrent decode), v41_partition_trial.sh, the V4 harnesses,
-                    and the raw *.jsonl
+patches/v41/        the 13 patches on vLLM PR #56201 head 79a7108d9a; notes in patches/README.md
+patches/            the earlier DeepSeek-V4-Flash series (0001-0009) this work built on
+docker/             Dockerfile.fullbuild and vastai-build-push-v41.sh (verifies both tree SHAs)
+launch/             run-v41-pp8.sh (PP=8 launch), warm-engram-cache.sh (page-cache Engram)
+run.sh              this box's entry point: run-v41-pp8.sh with the patched checkout and P2P
+bench/              bench_v41_check.py (coherence + needles), bench_v41_matrix.py
+                    (context x concurrency), bench_v41_decode_window.py (prefill-free
+                    concurrent decode), v41_partition_trial.sh, and the raw *.jsonl
 SETTINGS.md         every flag and environment variable, and why it has that value
-RESULTS.md          all measurements, correctness tests, limits and measurement pitfalls
+RESULTS.md          all measurements, correctness tests and what is not done
 ```
 
 ## Clients

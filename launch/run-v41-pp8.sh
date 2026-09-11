@@ -1,13 +1,13 @@
 #!/bin/bash
 # DeepSeek-V4.1-Flash on 8x CMP 170HX (GA100, sm_80, 64 GB each), PP=8.
 #
-# STATUS: RUNNING since 2026-09-10 (RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+# STATUS: RUNNING since 2026-09-10 (RESULTS.md).
 # Image zanooda/vllm-sm80-ds41f:v41-sm80 (tree 70aaaced9d) plus patches 0009-0013
 # bind-mounted from a v41-sm80 checkout (DSV41_VLLM_SRC); rebuild to bake them in.
 #
 # Usage: run-v41-pp8.sh [--plain] [--maxlen N] [--engram gpu|cpu|disk]
 #
-# Why these settings (details in SETTINGS.md#deepseek-v41-flash):
+# Why these settings (details in SETTINGS.md):
 #   PP=8, no TP        PCIe Gen2 x4: TP loses 6.6x on prefill (measured on V4). With the
 #                      cmpunlocker BAR1 P2P enabled, NCCL_P2P_LEVEL=SYS (passed through)
 #                      routes the hops GPU-to-GPU; measured: no speed change, link-bound.
