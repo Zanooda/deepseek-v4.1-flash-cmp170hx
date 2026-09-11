@@ -1,0 +1,231 @@
+From 9743f741ebf2167df60f4a78af7fe8423f902dda Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Fri, 11 Sep 2026 15:14:22 +0000
+Subject: [PATCH 13/13] Engram storage=cpu: load the pinned tables without a
+ host-memory transient
+
+Two things made `--engram-config '{"storage":"cpu"}'` OOM-kill the two
+table-owning workers on a 278 GB host even though the tables are 2 x 101 GB:
+
+1. torch's caching pinned-host allocator rounds every block up to a power
+   of two, so torch.empty(..., pin_memory=True) for a 98.3 GB table takes a
+   128 GiB pinned block (and 4 GiB for the 3.1 GB scales): 264 GiB for the
+   pair. Allocate a plain CPU tensor at the exact size and page-lock it with
+   cudaHostRegister instead (_pinned_exact). Registered memory is pinned and
+   UVA-addressable exactly like cudaHostAlloc memory, so the existing
+   get_cuda_view_from_cpu_tensor lookup path is unchanged.
+
+2. The generic loader materialises each table in host RAM
+   (safe_open().get_tensor copies the 98 GB tensor) before copy_() into the
+   pinned parameter: ~200 GB per table at peak. Register the two tensor
+   names as skipped (the iterator then also takes the no-mmap path for that
+   shard, like storage=disk) and fill the pinned parameters straight from
+   the shard after loading with chunked preadv (256 MiB, 8 threads), using
+   the same header-based locator _DiskEngramTable uses. The model's
+   load_weights runs the fill and marks the two parameters loaded.
+
+Measured on the 8x CMP 170HX box (278 GB RAM): both tables read in 89 s and
+98 s, steady MemAvailable 61 GiB, needles 3/3 at 128k. Against the NVMe
+gather: 128k single-stream TTFT 21.3-23.5 s -> 17.3 s (6,066 tok/s prefill),
+512k 88-106 s -> 78.7 s, 32k 8.1 s -> 5.8 s; decode at 128k 104-109 ->
+117 tok/s.
+---
+ vllm/models/deepseek_v4_1/common/engram.py | 128 ++++++++++++++++++---
+ vllm/models/deepseek_v4_1/nvidia/model.py  |  13 ++-
+ 2 files changed, 123 insertions(+), 18 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index fdcc19fc11..61f00207cb 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -40,6 +40,7 @@ import json
+ import os
+ import re
+ import struct
++import time
+ import weakref
+ 
+ import numpy as np
+@@ -937,6 +938,24 @@ class _DiskEngramTable:
+         return self.dev_vals, self.dev_scales, inv_dev, n
+ 
+ 
++def _pinned_exact(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
++    """A CPU tensor pinned at its exact size (cudaHostRegister on a plain
++    allocation), bypassing the caching host allocator's power-of-two rounding.
++    Registered memory is page-locked and UVA-addressable like cudaHostAlloc
++    memory (``is_pinned()`` is true, ``get_cuda_view_from_cpu_tensor`` works).
++    Never unregistered: the tables live for the whole process."""
++    t = torch.empty(shape, dtype=dtype, device="cpu")
++    nbytes = t.numel() * t.element_size()
++    if nbytes:
++        err = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 0)
++        if int(err) != 0:
++            raise RuntimeError(
++                f"cudaHostRegister of {nbytes / 1024**3:.1f} GiB failed with {err}"
++            )
++        assert t.is_pinned()
++    return t
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """The n-gram hash table, sharded by complete hash heads over TP ranks.
+     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+@@ -1021,24 +1040,49 @@ class ParallelEngramEmbedding(nn.Module):
+             return
+         self.disk = None
+ 
++        # cpu mode: the generic loader would materialise the whole 98 GiB
++        # table in host RAM (safe_open().get_tensor copies) before copy_()
++        # into the pinned parameter -- ~200 GiB per table at peak, which is
++        # what OOM-killed the workers on a 278 GB host. Skip the tensors in
++        # the loader and fill the pinned buffers straight from the shard in
++        # chunks after loading (fill_pinned_from_checkpoint).
++        self._pinned_fill: tuple[str, str] | None = None
++        if cpu_offload and hf_prefix is not None:
++            from vllm.model_executor.model_loader.weight_utils import (
++                register_skip_weight_names,
++            )
++
++            register_skip_weight_names(
++                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
++            )
++            self._pinned_fill = (get_current_vllm_config().model_config.model, hf_prefix)
++
+         # Explicit device: model init runs under a `torch.device("cuda")`
+-        # context, which would otherwise put the shard in HBM.
+-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+-        self.weight = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+-            ),
+-            requires_grad=False,
+-        )
+-        self.weight_scale_inv = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings,
+-                dim // block_size,
+-                dtype=torch.uint8,
+-                **kwargs,
+-            ),
+-            requires_grad=False,
+-        )
++        # context, which would otherwise put the shard in HBM. In cpu mode
++        # the buffers are pinned with cudaHostRegister at their exact size:
++        # torch's pinned allocator rounds every block up to a power of two,
++        # which turns a 98.3 GB table into a 128 GiB pinned block (the two
++        # tables would need 264 GiB of host memory before anything else).
++        if cpu_offload:
++            self.weight = nn.Parameter(
++                _pinned_exact((self.part_num_embeddings, dim), torch.float8_e4m3fn),
++                requires_grad=False,
++            )
++            self.weight_scale_inv = nn.Parameter(
++                _pinned_exact((self.part_num_embeddings, dim // block_size), torch.uint8),
++                requires_grad=False,
++            )
++        else:
++            self.weight = nn.Parameter(
++                torch.empty(self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn),
++                requires_grad=False,
++            )
++            self.weight_scale_inv = nn.Parameter(
++                torch.empty(
++                    self.part_num_embeddings, dim // block_size, dtype=torch.uint8
++                ),
++                requires_grad=False,
++            )
+         for param in (self.weight, self.weight_scale_inv):
+             set_weight_attrs(
+                 param,
+@@ -1056,6 +1100,56 @@ class ParallelEngramEmbedding(nn.Module):
+                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+             )
+ 
++    def needs_checkpoint_fill(self) -> bool:
++        return self._pinned_fill is not None
++
++    def fill_pinned_from_checkpoint(self, threads: int = 8) -> None:
++        """Read this rank's rows of the two table tensors from the safetensors
++        shard straight into the pinned parameters (chunked ``preadv``, no
++        intermediate copy). The page cache the reads leave behind is
++        evictable, so the only resident cost is the parameters themselves."""
++        assert self._pinned_fill is not None
++        model_path, hf_prefix = self._pinned_fill
++        t0 = time.perf_counter()
++        for key, param, width, dtype in (
++            (f"{hf_prefix}.embed.weight", self.weight, self.dim, "F8_E4M3"),
++            (
++                f"{hf_prefix}.embed.scale",
++                self.weight_scale_inv,
++                self.dim // self.block_size,
++                "F8_E8M0",
++            ),
++        ):
++            path, base = _DiskEngramTable._locate(
++                model_path, key, (self.num_embeddings, width), dtype
++            )
++            dst = param.data.view(torch.uint8).reshape(-1).numpy()
++            nbytes = dst.nbytes
++            assert nbytes == self.part_num_embeddings * width
++            start = base + self.vocab_start_idx * width
++            step = 256 << 20
++            fd = os.open(path, os.O_RDONLY)
++            try:
++
++                def read_chunk(off: int) -> None:
++                    end = min(off + step, nbytes)
++                    view = memoryview(dst)[off:end]
++                    pos = 0
++                    while pos < end - off:
++                        pos += os.preadv(fd, [view[pos:]], start + off + pos)
++
++                with concurrent.futures.ThreadPoolExecutor(threads) as pool:
++                    list(pool.map(read_chunk, range(0, nbytes, step)))
++            finally:
++                os.close(fd)
++        self._pinned_fill = None
++        logger.info(
++            "Engram table %s: %.1f GiB read into pinned host memory in %.0f s",
++            hf_prefix,
++            (self.weight.numel() + self.weight_scale_inv.numel()) / 1024**3,
++            time.perf_counter() - t0,
++        )
++
+     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+         """Parameters when resident, else cached UVA views of the pinned shard.
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 8d58c1092d..53a95713a4 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -75,7 +75,12 @@ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
+-from ..common.engram import Engram, EngramLayout, NgramHashState
++from ..common.engram import (
++    Engram,
++    EngramLayout,
++    NgramHashState,
++    ParallelEngramEmbedding,
++)
+ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
+ 
+ if typing.TYPE_CHECKING:
+@@ -1223,6 +1228,12 @@ class DeepseekV41LLMForCausalLM(  # noqa: E302
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        # Engram storage=cpu: the two table tensors were skipped by the loader
++        # (see ParallelEngramEmbedding); read them into the pinned buffers now.
++        for name, module in self.named_modules():
++            if isinstance(module, ParallelEngramEmbedding) and module.needs_checkpoint_fill():
++                module.fill_pinned_from_checkpoint()
++                loaded_params.update({f"{name}.weight", f"{name}.weight_scale_inv"})
+         self.process_weights_after_loading()
+         return loaded_params
+ 
+-- 
+2.53.0
+

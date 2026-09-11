@@ -194,3 +194,34 @@ Not for production, but required to reproduce the numbers:
 | `--tensor-parallel-size` | PP wins on this hardware; see above. TP3 is also arithmetically impossible (64 heads, 256 experts don't divide by 3). |
 | `--quantization` | The checkpoint's format is auto-detected. Forcing it breaks MoE scale loading. |
 | `VLLM_SM86_SPLITK=0` | Helped ~8% on the *older* overlay stack at low TP. Untested on this branch; the kernel it targets may not be in this path. |
+
+
+---
+
+## DeepSeek-V4.1-Flash (`launch/run-v41-pp8.sh`)
+
+The V4.1 launch is the V4 one with these differences. Every value below was measured on the
+2026-09-10/11 runs unless marked otherwise.
+
+| flag / env | value | why |
+|---|---|---|
+| `--pipeline-parallel-size 8` | 8 cards | ~327 GB of resident weights need eight 64 GB cards; PP for the same PCIe reasons as V4 |
+| `--engram-config '{"storage":"cpu"}'` (`DSV41_ENGRAM`) | **cpu** since the 278 GB RAM upgrade (2026-09-11) | the two Engram tables (98 GB fp8 + 3 GB scales each) pinned in host RAM on the ranks owning layers 1 and 14, gathered by the GPU over UVA. Needs patch 0013 to fit (see patches/README); steady ~217 GB used. Measured vs `disk`: prefill +25–38 % (128k TTFT 21–23 s → 17.3 s), decode +10 %. `disk` remains for small-RAM hosts: rows are read from the shards per step (`disk_threads` = NVMe queue depth), and `launch/warm-engram-cache.sh` pulls the shards into the page cache when RAM allows (roughly the `cpu` speed, evictable) |
+| `VLLM_PP_LAYER_PARTITION` | `5,5,5,5,5,5,5,5` | 40 backbone layers; the last rank also holds lm_head and the 3-layer DSpark drafter (~9 GB). Measured 2026-09-11: `5,5,5,5,5,5,6,4` gives a 2.2× KV pool (6.86M tokens) but −10 % concurrent decode; a last rank with < 4 layers cannot start (drafter aux states come from layers 36–38) |
+| `NCCL_P2P_LEVEL=SYS` | set when P2P is enabled | with the cmpunlocker BAR1 P2P the pipeline hops go `P2P/CUMEM` instead of through host memory; measured no speed change (link-bound), but it is the path that stays valid across the four root ports. Any `NCCL_*` variable in the launcher's environment is passed into the container |
+| `DSV41_GPUS` | `0,1,2,3,4,5,7,6` on this host | device order = rank order; GPU 6 (`c3:00.0`) is power-capped to 180 W (falls off the bus at stock), so it takes the last rank, which draws the least power |
+| `--max-model-len 1048576` | model maximum | `max_position_embeddings`; "2M" is pool capacity, not a request length (README) |
+| `--max-num-batched-tokens 4096` | 4096 | V4 showed prefill is not chunk-bound; 4096 halves the number of disk-Engram gathers per prompt vs 2048 |
+| `DSV4_LOGITS_ROW_CHUNK` | `64` | same transient as V4, now on the ratio-1 layers with N = 1M; also chunks the candidate-block select/mask |
+| `--speculative-config '{"method":"dspark","num_speculative_tokens":5}'` | 5 | `dspark_block_size=5` in the V4.1 config; V4.1 has no plain MTP method |
+| `--tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41` | | the PR's V4.1 parsers; the tokenizer mode auto-selects `deepseek_v41` |
+| `--kv-cache-dtype fp8` | fp8 | fp8_ds_mla layout (584 B/state); no FP4 KV exists in the checkpoint or on sm_80 |
+| `--block-size 128` | 128, not 256 | the indexer's kernel block is 128 on non-SM90 and the layer-compact layout cannot split a 256-token manager block into two; 256 fails at KV allocation with a clear message |
+| `VLLM_USE_BREAKABLE_CUDAGRAPH` | `1` | V4.1 is not torch-compiled (attention runs in an eager break); without breakable graphs there are no piecewise graphs at all and capture refuses `FULL_AND_PIECEWISE`. The V4 stack ran with them off. |
+| `DSV41_VLLM_SRC` | path to a `v41-sm80` checkout's `vllm/` dir | until the image is rebuilt with patch 0009, the launch script bind-mounts every Python file changed since the image's commit (`DSV41_IMG_COMMIT`, default `68de681be3`) |
+| `VLLM_DSV41_CAND_LOGITS` | unset (= on) | patch 0011: index layers 24/28/32/36 score only the candidate blocks. `0` restores full-context scoring + mask (identical output, slower, ~10 % smaller KV pool) |
+| `--gpu-memory-utilization 0.95` | 0.95 (was 0.90) | the KV pool is decided by the last rank (52 GiB of weights + drafter + lm_head + non-torch); 0.90 left it 3.3 GiB → 3,151,289 tokens, 0.95 leaves 6.5 GiB → **6,171,394 tokens** (5.9 × 1M), measured 2026-09-11 with decode unchanged. Capture and serving fit; ~3 GB physical headroom remains on that card |
+| `--enable-prompt-tokens-details` | on | adds `prompt_tokens_details.cached_tokens` to `usage`; without it clients such as litellm never see prefix-cache hits and their cache-read price never applies |
+| `--limit-mm-per-prompt '{"image":8}'` | 8 (`DSV41_MM_LIMIT`) | the checkpoint's V4.1 vision encoder (32 layers, patch 14) is loaded and works through the OpenAI image_url content type; the vLLM default of one image per request is too few for agent screenshots |
+| `--max-num-seqs 8` | 8 (`DSV41_MAX_SEQS`) | bounds the **total** running requests, not requests per micro-batch: `1` serialises users (measured: Running 1, Waiting 7). Keep ≥ the concurrency you serve |
+| `--attention-backend` | unset | SM8x auto-routes to `TRITON_MLA_SPARSE_DSV41`; anything else is rejected with a clear error |

@@ -1,5 +1,155 @@
 # Patches
 
+## ★ 2026-09-10: DeepSeek-V4.1-Flash series — `patches/v41/` (RUNS on 8× CMP 170HX, PP=8)
+
+A second, independent patch series for **DeepSeek-V4.1-Flash** on sm_80. It does **not**
+stack on the V4 series below: the base is different, and everything below this section
+still describes the V4-Flash-0731 stack (`c3046d1` + `0002`–`0009`), which is unchanged.
+
+**Base:** upstream vLLM **PR #56201** ("[Model] Support DeepSeek-V4.1-Flash", *open*,
+unmerged), head commit `79a7108d9aea27ddab99ce1779290d300b17fc23`, tree
+`a731238e73f0023b0a43f6d91c07c466295224e6`. The PR is 147 files / +20k lines against
+September `main`, 1,429 upstream commits ahead of the V4 base. Forward-porting it onto
+`c3046d1` was tried first (80 files clean, 37 conflicted, 68 of its modified files had
+drifted upstream in between, and its new code imports a dozen upstream modules the old
+base lacks) and abandoned; the series is the inverse port instead: **PR head + the fork's
+sm_80 layer + our patches**, which is what `patches/v41/` contains.
+
+```bash
+git clone https://github.com/vllm-project/vllm.git && cd vllm
+git fetch origin refs/pull/56201/head && git checkout -B v41-sm80 79a7108d9a
+git rev-parse HEAD^{tree}     # a731238e73f0023b0a43f6d91c07c466295224e6
+git am ../deepseek-v4-cmp170hx/patches/v41/*.patch
+git rev-parse HEAD^{tree}     # 70aaaced9d8d2c2dce411b1aef19287c0134bf77
+```
+
+Verified 2026-09-10: `git am` of the eight patches onto a pristine `79a7108d9a` worktree
+applies with zero conflicts and reproduces tree `70aaaced…` byte-for-byte. If the PR is
+force-pushed and the SHA becomes unreachable, the tarball route from the V4 section
+works for `vllm-project/vllm` too; [docker/vastai-build-push-v41.sh](../docker/vastai-build-push-v41.sh)
+does both and checks both tree SHAs.
+
+| # | patch | what | notes |
+|---|---|---|---|
+| v41/0001 | `sm_80-fork-delta` (72 files, +11.5k) | haosdent's whole sm_80 layer (`62195e9..c3046d1`: the Ampere DSv4 attention on the ROCm Triton kernels, `fp8_sm80.py`, `mqa_logits_triton.py`, Marlin/MoE/mHC/DSpark work, csrc `topk.cu`/`marlin.cu`/`custom_all_reduce.cuh`) rebased onto the PR head | 49 files clean, 22 hand-merged. Dropped: the fork's `KVBlockZeroer` rewrite (upstream already masks heterogeneous pages) and its `sparse_mla_triton_warmup.py` hunk (file removed upstream; the indexer warms its own Triton kernels). Marlin MoE `clamp_limit`/`gemm1_*` kwargs became upstream's `activation_config`. |
+| v41/0002 | `patches-0002-0006` | our V4 patches **0002–0006** hand-ported (they carry no index blobs, so 3-way cannot apply them): DSpark-on-PP (draft `pipeline_parallel_size=1`, `broadcast_draft`, runner scatter, drafter embedding from checkpoint), the prefill top-k torch fallback (0005a) and `DSV4_LOGITS_ROW_CHUNK` (0006) | 0003 applied clean by itself. 0005a/0006 now also row-chunk V4.1's candidate-block select/mask, which sits between the logits and the row top-k. |
+| v41/0003–0006 | PR **#52645** commits 1–4 | the DSML malformed-wrapper recovery, i.e. our **0007** — taken from the PR's own (rebased) commits instead of our old hand-port, because the PR's base `7ca49fbe4b` is an ancestor of the V4.1 base | commits 5–6 (reasoning-adapter delegation, orphan hardening) conflict and are skipped, matching the V4 decision. One trivial conflict in `streaming_parser_engine.py` (both sides add a field). |
+| v41/0007 | merge fixups | the three defects a static undefined-name pass found in the hand-merge: ROCm ragged graph-buffer builder body/signature mismatch, the fork's three tilelang kernels referencing a removed module-level `pass_configs` (now `@tilelang_jit`), a test import | |
+| v41/0008 | **DeepSeek V4.1 on SM8x** | the new work — see below | |
+| v41/0009 | **PP=8 runtime fixes** | everything the first engine start needed, found in eight launch iterations — see below | not in the published image (`70aaaced9d`); `launch/run-v41-pp8.sh` bind-mounts these files from a checkout (`DSV41_VLLM_SRC`) until a rebuild (`bdde91029a`) |
+| v41/0010 | **Engram disk gather in C** | the per-step row gather of `storage=disk` moves from a Python `preadv` thread pool (~125k syscalls/s, the prefill bottleneck) to a runtime-compiled C `pthread` helper (`engram_gather`, built with gcc into `$VLLM_CACHE_ROOT/engram_pread/`, Python pool as fallback) | prefill 32k c=1 1,6xx → 3,255 tok/s, 128k → 4,832 (3.4×). Python-only, bind-mounted like 0009 |
+| v41/0011 | **candidate-only indexer logits** | index layers 24/28/32/36 score just the 2,048 candidate blocks layer 20 published instead of the whole context and then masking — see below | lossless (identical top-k set, bit-identical scores); Python-only, bind-mounted like 0009. `VLLM_DSV41_CAND_LOGITS=0` restores the full path |
+| v41/0012 | **lenient DSML wrapper spelling** | the V4.1 parser also accepts `<｜DSML｜calls>` / `<｜DSML｜_calls>` (and the closing forms), which the model writes near the context limit; the tool call was already recovered through the invoke markers, this stops the misspelled closing tag leaking into the reply | mirrors Schaka/170hx-journey `ebaadb6`; the "tool call opens inside `<think>`" half of that commit was already covered by the PR #52645 recovery (0003–0006). 107 parser tests pass. Python-only, bind-mounted like 0009 |
+| v41/0013 | **Engram storage=cpu without the load transient** | exact-size `cudaHostRegister` pinning (torch's pinned allocator rounds a 98 GB table to 128 GiB) and a direct chunked fill of the pinned tables from the shard (the loader materialised a 98 GB copy first) | needed for `storage=cpu` on the 278 GB box (OOM-killed three times before). Measured: prefill +25–38 %, decode +10 % vs the NVMe gather; both tables load in ~95 s. Python-only, bind-mounted like 0009 |
+
+**Not carried, because upstream has them:** 0008 (NaN guard: `rejection_sampler_utils.py:111`
+upstream) and 0009 (`is_current_stream_capturing` guard + no `eager_scratch.py` upstream).
+
+### v41/0008 — what makes V4.1 run on sm_80
+
+- **Attention** — `models/deepseek_v4_1/ampere/ampere_sparse.py`: 40 lines. The PR ships a
+  ROCm Triton implementation (`deepseek_v4_1/amd/rocm.py`, `DeepseekV41ROCMAiterMLAAttention`)
+  that already handles everything V4.1 adds over V4 (ratio-0/1/2 layer types, KV sharing
+  via `kv_source_layer_ids`, candidate-block filtering, indexer-K-from-latent); its
+  aiter-only GEMMs self-disable off ROCm. Exactly as the fork did for V4, the Ampere layer
+  is a subclass with backend name `TRITON_MLA_SPARSE_DSV41` and `capability.major == 8`.
+  `nvidia/model.py::_select_dsv4_attn_cls` gets a `major == 8` branch (rejects the MXFP4
+  indexer cache, which is SM100-only).
+- **fp8 below SM89** — the PR's new kernels use native `tl.float8e4nv` converts, which
+  Triton refuses on sm_80. Substituted with the fork's `fp8_sm80.py` helpers in
+  `deepseek_v4_1/common/ops/{cache_utils,fused_compress_quant_cache,indexer_k_store}.py`
+  and the Engram lookup kernel; `cache_utils` gains the fork's `is_cutedsl_supported()` gate.
+- **Dense MXFP8 linears** (`[32,32]` blocks, UE8M0) — go through upstream's own
+  `MarlinMxfp8LinearKernel` (sm_75+, W8A16) with no change. `wo_a` is the exception: the
+  einsum o_proj reads the raw `[N,K]` weight, which a Marlin repack destroys, so the Ampere
+  layer sets `wo_a.mxfp8_dequant_to_bf16` and `ModelOptLinearMethod` honours it by picking
+  the emulation kernel (bf16 dequant at load; +1.3 GiB total). `_get_cached_wo_a_bf16`
+  learns to accept an already-bf16 weight.
+- **Engram** — `EngramConfig.storage = cpu | gpu | disk` (+ `disk_threads`). `disk`: the
+  two 98 GiB tables are never loaded (their names are registered as skipped in the
+  safetensors iterator, so `get_tensor` never materialises them and the "weights not
+  initialized" check has nothing to miss); each step the batch's hash ids go to the host,
+  are de-duplicated, and the unique rows (256 B fp8 + 8 B UE8M0) are `pread` from the two
+  101 GB shards by a thread pool into pinned staging, copied to the device and dequantized
+  by the ordinary lookup kernel. The gather runs in the V2 runner's `DeepseekV41ModelState`
+  hook (eager, before the forward, never inside graph capture); the forward skips its own
+  `prepare_embeddings` for disk tables. `cpu` (upstream default, ~203 GiB pinned) and `gpu`
+  are unchanged apart from the byte-view fix.
+- Experts (`expert_dtype=fp4`, I8-packed, E8M0 block-16 scales) take the same
+  `Mxfp4MoEMethod` → Marlin path the fork already runs for V4-Flash. **Untested on
+  V4.1's 384-expert / block-16 layout.**
+
+### v41/0009 — what the first engine start needed
+
+- **PP splits inside kv-sharing groups** (`deepseek_v4_1/pp_share.py`, the big one). V4.1
+  layers with `compress_ratio > 0` read the compressed KV cache of the nearest
+  `kv_source_layer_ids` entry below them (2, 8, 14, 20); non-owning index sources read that
+  source's indexer K cache; layer 20 also publishes candidate blocks for every later indexer
+  and each index source publishes top-k indices for the layers up to the next. Upstream
+  refuses any partition that splits a group — and layer 20's group is the last 20 layers,
+  so no 64 GB partition can satisfy it. The fix registers a same-spec **replica** of the
+  source's compressed cache (and indexer K cache) on every rank hosting consumers, under
+  the source's exact layer name, so the KV manager gives it the same block tables; each
+  step the rows the source wrote (584 B per compressed state, 132 B per index key, gathered
+  by slot mapping) plus the candidate-block and top-k rows ride downstream inside the
+  pipeline's `IntermediateTensors`, are scattered into the replicas before the consumer
+  layers run and re-gathered for the next hop. ~43 MB per hop per 4096-token chunk.
+- `input_ids` on every PP rank: V4.1's MoE (image-sentinel routing) and the Engram hash on
+  the rank owning layer 14 read token ids; the V2 runner and the CUDA-graph capture path
+  cleared them on non-first ranks (`pp_requires_input_ids` model flag).
+- Loader: every rank walks the whole checkpoint, so ranks that do not own an Engram layer
+  must skip its 98 GiB table too; and `safe_open` of the two 101 GB shards maps them
+  privately, which the kernel's overcommit heuristic refuses on a 32 GB host, so the four
+  small tensors in those shards are read with `pread` instead.
+- KV cache config: workers may support different layout sets (a rank without an indexer
+  cache supports more), so intersect instead of asserting equality; and a rank owning no
+  layer of a group (ratio-2 compressor ring buffers exist only on ranks 0–2) must not get
+  tensors for the group's foreign layers.
+- sm_80 SWA metadata builder that skips FlashMLA tile-scheduler planning (FlashMLA is not
+  compiled for sm_80); `num_heads` for the fork's Triton indexer; pinned Engram staging
+  allocated on the CPU under the CUDA device context; Triton constexprs.
+- Launch: `--block-size 128` (256 does not split into the 128-token indexer kernel blocks
+  on the layer-compact layout) and breakable CUDA graphs **on** (V4.1 is not
+  torch-compiled; without them there are no piecewise graphs at all).
+
+### v41/0011 — candidate-only indexer logits (2026-09-11)
+
+V4.1's two-level selection: layer 20 scores the full context and publishes the 2,048
+best 8-position blocks per token; layers 24/28/32/36 mask their own scores to those
+blocks before the row top-k (512). The sm_80 Triton path still computed the full
+`[rows, context]` logits on those four layers and threw away everything outside the
+16,384 candidate positions. `vllm/v1/attention/ops/mqa_logits_candidates_triton.py`
+scores only the candidates: one Triton kernel gathers K at `cand*8+o` (prefill from the
+gathered K, decode straight from the paged indexer cache through the block table), writes
+a compact `[rows, 16384]` matrix with `-inf` outside the causal bound, vLLM's CUDA
+`top_k_per_row_decode` picks the 512, and a small kernel maps columns back to positions
+(dropping `-inf` picks, which the CUDA kernel would otherwise return for rows with fewer
+finite candidates — those would point past the row's causal bound). Taken only when the
+row width exceeds 16,384 (below that every block is a candidate and the mask is a no-op).
+
+Verified against `full logits → apply_candidate_mask → top-k` on one card: scores
+bit-identical, identical top-k sets on prefill (incl. single-column rows) and decode at
+two cache block sizes. Kernel time (64 heads × 128): prefill 64 rows × 131k 2.42 → 0.40 ms,
+decode 48 rows × 131k 2.4 → 0.32 ms, 8 rows × 1M 3.0 → 0.16 ms. In the engine the KV pool
+grew from 2,827,499 to 3,151,289 tokens (profiling no longer sees the full-width transient);
+needles 13/13 after the change. Decode-step impact is small because the indexer was a
+smaller slice of the step than estimated — numbers in [RESULTS](../RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+
+### What was verified, and what was not
+
+Verified: `py_compile` of every changed file; a pyflakes pass (undefined names / syntax)
+over the 100+ changed files is clean; the series re-applies byte-exact. **Built** on a
+vast.ai box (122 cores, 792 GB RAM) with `docker/vastai-build-push-v41.sh`: both tree SHAs
+verified, csrc compiled first try (663 s at MAX_JOBS=64), pushed as
+`zanooda/vllm-sm80-ds41f:v41-sm80` (digest `sha256:283fc7b0…`, `_C` 60 and `_moe_C` 22
+sm_80 kernels). **Running on the 8× CMP 170HX box since 2026-09-10 22:26 UTC** (`launch/run-v41-pp8.sh`,
+Engram from disk, partition 5×8): chat coherence 5/5 (factual, arithmetic, code,
+multi-turn memory, tool call), needles **19/19** — depths 10/50/90 % at 4k, 32k, 128k,
+512k and 1M (820k real tokens), plus 4 concurrent 32k needles with distinct passphrases
+and no cross-request bleed. Speeds in [RESULTS](../RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+
+---
+
 ## ★ 2026-08-13: recommended base is now `c3046d1` — patch 0001 is no longer needed
 
 Upstream's 41-commit serving-optimization campaign (base

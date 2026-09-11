@@ -1,0 +1,493 @@
+From 1b73403933b696a773e27471693286c3e31dd9c4 Mon Sep 17 00:00:00 2001
+From: jinbagi <4094424+jinbagi@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 14:58:03 +0900
+Subject: [PATCH 04/13] [Bugfix][Parser] Require invoke end for provisional
+ recovery
+
+Assisted-by: OpenAI Codex
+Signed-off-by: jinbagi <4094424+jinbagi@users.noreply.github.com>
+(cherry picked from commit 9e033af5814b57d594d459e30424c2967f9448bc)
+---
+ tests/parser/engine/test_deepseek_v4.py       | 191 +++++++++++++++++
+ .../test_deepseek_v4_malformed_recovery.py    | 195 ------------------
+ vllm/parser/deepseek_v4.py                    |   1 +
+ vllm/parser/engine/parser_engine_config.py    |   4 +
+ vllm/parser/engine/streaming_parser_engine.py |  17 +-
+ 5 files changed, 203 insertions(+), 205 deletions(-)
+ delete mode 100644 tests/parser/engine/test_deepseek_v4_malformed_recovery.py
+
+diff --git a/tests/parser/engine/test_deepseek_v4.py b/tests/parser/engine/test_deepseek_v4.py
+index 873a1e6bd2..e80d248551 100644
+--- a/tests/parser/engine/test_deepseek_v4.py
++++ b/tests/parser/engine/test_deepseek_v4.py
+@@ -619,6 +619,197 @@ def _tool_calls(*invokes):
+     return DSML_TOOL_START + "\n".join(invokes) + DSML_TOOL_END
+ 
+ 
++def _recovery_tool():
++    return _make_tool("get_weather", {"city": {"type": "string"}})
++
++
++def _recovery_invoke(name="get_weather", city="Seoul"):
++    return _invoke(name, ("city", "true", city))
++
++
++def _content_recovery_parser(mock_tokenizer, *tools):
++    return DeepSeekV4Parser(
++        mock_tokenizer,
++        tools=list(tools),
++        chat_template_kwargs={"thinking": False},
++    )
++
++
++class TestMalformedWrapperRecovery:
++    def test_missing_start_wrapper_recovers_declared_tool(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
++
++        result = parser.extract_tool_calls(
++            _recovery_invoke() + DSML_TOOL_END, mock_request
++        )
++
++        assert result.tools_called is True
++        assert len(result.tool_calls) == 1
++        assert result.tool_calls[0].function.name == "get_weather"
++        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
++
++    def test_corrupted_start_wrapper_still_recovers_invoke(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
++        text = "<｜DSML｜toolcalls>\n" + _recovery_invoke() + "\n" + DSML_TOOL_END
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is True
++        assert len(result.tool_calls) == 1
++        assert result.tool_calls[0].function.name == "get_weather"
++        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
++
++    def test_undeclared_orphan_invoke_stays_content(self, mock_tokenizer, mock_request):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        text = _recovery_invoke(name="not_declared") + DSML_TOOL_END
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False
++        assert result.tool_calls == []
++        assert result.content == text
++
++    def test_orphan_invoke_without_tools_stays_content(
++        self, mock_tokenizer, mock_request
++    ):
++        parser = _content_recovery_parser(mock_tokenizer)
++        text = _recovery_invoke() + DSML_TOOL_END
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False
++        assert result.tool_calls == []
++        assert result.content == text
++
++    def test_request_without_tools_does_not_reuse_prior_tool_names(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        text = _recovery_invoke() + DSML_TOOL_END
++
++        mock_request.tools = [tool]
++        first = parser.extract_tool_calls(text, mock_request)
++        mock_request.tools = []
++        second = parser.extract_tool_calls(text, mock_request)
++
++        assert first.tools_called is True
++        assert second.tools_called is False
++        assert second.tool_calls == []
++        assert second.content == text
++
++    def test_tool_choice_none_disables_recovery(self, mock_tokenizer, mock_request):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        mock_request.tool_choice = "none"
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        text = _recovery_invoke() + DSML_TOOL_END
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False
++        assert result.tool_calls == []
++        assert result.content == text
++
++    def test_truncated_recovery_candidate_flushes_as_content(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        text = "Docs quote " + DSML_INVOKE_PREFIX + "get_wea"
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False
++        assert result.tool_calls == []
++        assert result.content == text
++
++    def test_valid_name_without_invoke_end_stays_content(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        text = (
++            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
++            f"{_param('city', 'true', 'Seoul')}"
++        )
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False
++        assert result.tool_calls == []
++        assert result.content == text
++
++    def test_tool_end_without_invoke_end_stays_content(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        text = (
++            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
++            f"{_param('city', 'true', 'Seoul')}\n"
++            f"{DSML_TOOL_END}"
++        )
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False
++        assert result.tool_calls == []
++        assert result.content == text
++
++    def test_streaming_orphan_invoke_recovers_after_split_marker(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        chunks = [
++            "Checking.\n",
++            "<｜DSML",
++            '｜invoke name="get_weather">',
++            f"\n{_param('city', 'true', 'Seoul')}\n",
++            DSML_INVOKE_END,
++            DSML_TOOL_END,
++        ]
++
++        results = simulate_tool_streaming(parser, mock_request, chunks)
++
++        assert collect_function_name(results) == "get_weather"
++        assert json.loads(collect_tool_arguments(results)) == {"city": "Seoul"}
++        assert collect_content(results) == "Checking.\n"
++
++    def test_streaming_tool_end_without_invoke_end_stays_content(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        chunks = [
++            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n",
++            f"{_param('city', 'true', 'Seoul')}\n",
++            DSML_TOOL_END,
++        ]
++
++        results = simulate_tool_streaming(parser, mock_request, chunks)
++
++        assert collect_function_name(results) is None
++        assert collect_tool_arguments(results) == ""
++        assert collect_content(results) == "".join(chunks)
++
++
+ class TestParallelUnwrapping:
+     @pytest.fixture
+     def weather_tool(self):
+diff --git a/tests/parser/engine/test_deepseek_v4_malformed_recovery.py b/tests/parser/engine/test_deepseek_v4_malformed_recovery.py
+deleted file mode 100644
+index 8b59758ce8..0000000000
+--- a/tests/parser/engine/test_deepseek_v4_malformed_recovery.py
++++ /dev/null
+@@ -1,195 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-import json
+-from unittest.mock import MagicMock
+-
+-from tests.parser.engine.conftest import make_mock_tokenizer
+-from tests.parser.engine.streaming_helpers import (
+-    collect_content,
+-    collect_function_name,
+-    collect_tool_arguments,
+-    simulate_tool_streaming,
+-)
+-from vllm.entrypoints.openai.chat_completion.protocol import (
+-    ChatCompletionRequest,
+-    ChatCompletionToolsParam,
+-)
+-from vllm.parser.deepseek_v4 import (
+-    DSML_INVOKE_END,
+-    DSML_INVOKE_NAME_END,
+-    DSML_INVOKE_PREFIX,
+-    DSML_PARAM_CLOSE,
+-    DSML_TOOL_END,
+-    DeepSeekV4Parser,
+-)
+-
+-
+-def _tool(name: str = "get_weather") -> ChatCompletionToolsParam:
+-    return ChatCompletionToolsParam(
+-        type="function",
+-        function={
+-            "name": name,
+-            "parameters": {
+-                "type": "object",
+-                "properties": {"city": {"type": "string"}},
+-                "required": ["city"],
+-            },
+-        },
+-    )
+-
+-
+-def _request(*tools: ChatCompletionToolsParam):
+-    req = MagicMock(spec=ChatCompletionRequest)
+-    req.tools = list(tools)
+-    req.tool_choice = "auto"
+-    req.include_reasoning = True
+-    return req
+-
+-
+-def _invoke(name: str = "get_weather", city: str = "Seoul") -> str:
+-    return (
+-        f"{DSML_INVOKE_PREFIX}{name}{DSML_INVOKE_NAME_END}\n"
+-        f'<｜DSML｜parameter name="city" string="true">{city}{DSML_PARAM_CLOSE}\n'
+-        f"{DSML_INVOKE_END}"
+-    )
+-
+-
+-def _content_parser(*tools: ChatCompletionToolsParam) -> DeepSeekV4Parser:
+-    return DeepSeekV4Parser(
+-        make_mock_tokenizer({}),
+-        tools=list(tools),
+-        chat_template_kwargs={"thinking": False},
+-    )
+-
+-
+-def test_missing_start_wrapper_recovers_declared_tool():
+-    """Default thinking mode also recovers an invoke with no outer wrapper."""
+-    tool = _tool()
+-    request = _request(tool)
+-    parser = DeepSeekV4Parser(make_mock_tokenizer({}), tools=[tool])
+-
+-    result = parser.extract_tool_calls(_invoke() + DSML_TOOL_END, request)
+-
+-    assert result.tools_called is True
+-    assert len(result.tool_calls) == 1
+-    assert result.tool_calls[0].function.name == "get_weather"
+-    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
+-
+-
+-def test_corrupted_start_wrapper_still_recovers_invoke():
+-    """Regression for #51914: tool_calls -> toolcalls must not lose the invoke."""
+-    tool = _tool()
+-    request = _request(tool)
+-    parser = DeepSeekV4Parser(make_mock_tokenizer({}), tools=[tool])
+-    text = "<｜DSML｜toolcalls>\n" + _invoke() + "\n" + DSML_TOOL_END
+-
+-    result = parser.extract_tool_calls(text, request)
+-
+-    assert result.tools_called is True
+-    assert len(result.tool_calls) == 1
+-    assert result.tool_calls[0].function.name == "get_weather"
+-    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
+-
+-
+-def test_undeclared_orphan_invoke_stays_content():
+-    tool = _tool()
+-    request = _request(tool)
+-    parser = _content_parser(tool)
+-    text = _invoke(name="not_declared") + DSML_TOOL_END
+-
+-    result = parser.extract_tool_calls(text, request)
+-
+-    assert result.tools_called is False
+-    assert result.tool_calls == []
+-    assert result.content == text
+-
+-
+-def test_orphan_invoke_without_tools_stays_content():
+-    request = _request()
+-    parser = _content_parser()
+-    text = _invoke() + DSML_TOOL_END
+-
+-    result = parser.extract_tool_calls(text, request)
+-
+-    assert result.tools_called is False
+-    assert result.tool_calls == []
+-    assert result.content == text
+-
+-
+-def test_request_without_tools_does_not_reuse_prior_tool_names():
+-    tool = _tool()
+-    parser = _content_parser(tool)
+-    text = _invoke() + DSML_TOOL_END
+-
+-    first = parser.extract_tool_calls(text, _request(tool))
+-    second = parser.extract_tool_calls(text, _request())
+-
+-    assert first.tools_called is True
+-    assert second.tools_called is False
+-    assert second.tool_calls == []
+-    assert second.content == text
+-
+-
+-def test_tool_choice_none_disables_recovery():
+-    tool = _tool()
+-    request = _request(tool)
+-    request.tool_choice = "none"
+-    parser = _content_parser(tool)
+-    text = _invoke() + DSML_TOOL_END
+-
+-    result = parser.extract_tool_calls(text, request)
+-
+-    assert result.tools_called is False
+-    assert result.tool_calls == []
+-    assert result.content == text
+-
+-
+-def test_truncated_recovery_candidate_flushes_as_content():
+-    tool = _tool()
+-    request = _request(tool)
+-    parser = _content_parser(tool)
+-    text = "Docs quote " + DSML_INVOKE_PREFIX + "get_wea"
+-
+-    result = parser.extract_tool_calls(text, request)
+-
+-    assert result.tools_called is False
+-    assert result.tool_calls == []
+-    assert result.content == text
+-
+-
+-def test_valid_name_without_invoke_end_stays_content():
+-    """A declared name alone is not enough to commit a recovered call."""
+-    tool = _tool()
+-    request = _request(tool)
+-    parser = _content_parser(tool)
+-    text = (
+-        f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+-        '<｜DSML｜parameter name="city" string="true">Seoul</｜DSML｜parameter>'
+-    )
+-
+-    result = parser.extract_tool_calls(text, request)
+-
+-    assert result.tools_called is False
+-    assert result.tool_calls == []
+-    assert result.content == text
+-
+-
+-def test_streaming_orphan_invoke_recovers_after_split_marker():
+-    tool = _tool()
+-    request = _request(tool)
+-    parser = _content_parser(tool)
+-    chunks = [
+-        "Checking.\n",
+-        "<｜DSML",
+-        '｜invoke name="get_weather">',
+-        '\n<｜DSML｜parameter name="city" string="true">Seoul</｜DSML｜parameter>\n',
+-        DSML_INVOKE_END,
+-        DSML_TOOL_END,
+-    ]
+-
+-    results = simulate_tool_streaming(parser, request, chunks)
+-
+-    assert collect_function_name(results) == "get_weather"
+-    assert json.loads(collect_tool_arguments(results)) == {"city": "Seoul"}
+-    assert collect_content(results) == "Checking.\n"
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index 5fc0f47bf2..bcf2bae7b9 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -204,6 +204,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
+                 ParserState.TOOL_BETWEEN,
+                 (EventType.TOOL_CALL_END,),
++                commit_provisional_tool_call=True,
+             ),
+             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+                 ParserState.CONTENT,
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index fbaa642453..e2523d0505 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -44,6 +44,10 @@ class Transition:
+     # engine buffers its semantic events, validates the completed tool name
+     # through a parser-supplied callback, and commits only after the call ends.
+     provisional_tool_call: bool = False
++    # Commit a buffered provisional call at this transition. Recovery paths
++    # that leave tool arguments through any other transition are restored as
++    # ordinary text.
++    commit_provisional_tool_call: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index eb1ec1fcab..d536c017da 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -537,10 +537,7 @@ class StreamingParserEngine:
+             # Tool names are expected to be compact. Avoid delaying an entire
+             # response if ordinary prose happens to quote an unterminated
+             # invoke marker.
+-            if (
+-                len(self._recovery_hold_name) > 256
+-                or "\n" in self._recovery_hold_name
+-            ):
++            if len(self._recovery_hold_name) > 256 or "\n" in self._recovery_hold_name:
+                 return self._abort_recovery_hold()
+ 
+         self._recovery_hold_events.extend(self._emit_for_state_now(text, token_count))
+@@ -602,13 +599,13 @@ class StreamingParserEngine:
+             return []
+ 
+         if self.state == ParserState.TOOL_ARGS:
++            if not transition.commit_provisional_tool_call:
++                return self._abort_recovery_hold()
+             transition_events = self._run_transition(transition, value, token_count)
+             self._recovery_hold_events.extend(transition_events)
+-            if EventType.TOOL_CALL_END in transition.events:
+-                events = self._recovery_hold_events
+-                self._clear_recovery_hold()
+-                return events
+-            return []
++            events = self._recovery_hold_events
++            self._clear_recovery_hold()
++            return events
+ 
+         return self._abort_recovery_hold()
+ 
+@@ -760,4 +757,4 @@ class StreamingParserEngine:
+                 value=to_emit,
+                 tool_index=self.tool_index,
+             )
+-        ]
+\ No newline at end of file
++        ]
+-- 
+2.53.0
+

@@ -1,0 +1,124 @@
+From 741500f528e640416bb80b4906224adff1c67873 Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Fri, 11 Sep 2026 12:31:58 +0000
+Subject: [PATCH 12/13] [Parser] Accept near-miss DSML wrapper spellings in the
+ DeepSeek V4.1 parser
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Near the context limit V4.1 sometimes writes the outer tool-call wrapper
+without the space or with an underscore (<｜DSML｜calls>, <｜DSML｜_calls>).
+The invoke markers inside are still spelled correctly, so the provisional
+recovery already turned the call into a tool call; what leaked was the
+misspelled closing wrapper as reply text after it.
+
+Register the two near-miss spellings of the start and end wrapper as extra
+text terminals of the V4.1 config, wired to exactly the transitions of the
+exact spelling (REASONING/CONTENT for the start, TOOL_ARGS/TOOL_BETWEEN for
+the end). They are never single tokens, so token-id mode is unchanged.
+
+Mirrors Schaka/170hx-journey ebaadb6 ("Recover a V4.1 tool call that opens
+inside the thinking block"); the other half of that commit, the tool call
+opening inside <think>, is already covered by the PR #52645 provisional
+recovery carried in this tree.
+
+Tests: 107 passed (tests/parser/engine/test_deepseek_v4{,1}.py), incl. four
+new cases parsing the complete two-call output with either near-miss spelling,
+with and without thinking, asserting no leaked text.
+---
+ tests/parser/engine/test_deepseek_v41.py | 25 ++++++++++++++++++++++
+ vllm/parser/deepseek_v41.py              | 27 +++++++++++++++++++++++-
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/tests/parser/engine/test_deepseek_v41.py b/tests/parser/engine/test_deepseek_v41.py
+index cc7d6e0aed..090ed1eb5a 100644
+--- a/tests/parser/engine/test_deepseek_v41.py
++++ b/tests/parser/engine/test_deepseek_v41.py
+@@ -95,6 +95,31 @@ def test_registered_adapters_parse_complete_output(thinking):
+     assert json.loads(calls[0].arguments) == {"city": "杭州", "count": 42}
+ 
+ 
++@pytest.mark.parametrize("thinking", [False, True])
++@pytest.mark.parametrize("wrapper", ["<｜DSML｜calls>", "<｜DSML｜_calls>"])
++def test_lenient_wrapper_spelling_parses_like_the_exact_one(thinking, wrapper):
++    """Near the context limit the model drops the space in the outer wrapper
++    (or writes an underscore). The calls must parse exactly as with the
++    correct spelling and the near-miss closing tag must not leak as text."""
++    end_wrapper = "</" + wrapper[1:]
++    text = ("Plan.</think>" if thinking else "") + CALLS.replace(
++        "<｜DSML｜ calls>", wrapper
++    ).replace("</｜DSML｜ calls>", end_wrapper)
++    tokenizer, tokens = tokenizer_for(text, False)
++    parser = parser_for(tokenizer, {"thinking": thinking})
++    reasoning, content, calls = parser.parse(
++        text,
++        _test_request(tools=DUMMY_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert (reasoning or "") == ("Plan." if thinking else "")
++    assert not (content or "").strip()
++    assert [call.name for call in calls] == ["get_weather", "add"]
++    assert json.loads(calls[0].arguments) == {"city": "杭州", "count": 42}
++    assert json.loads(calls[1].arguments) == {"x": 1.5, "y": 2.25}
++
++
+ @pytest.mark.parametrize(
+     ("controls", "text", "expected_reasoning", "reasoning_tokens"),
+     [
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index 4e32c384ca..8e3973a46f 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -12,10 +12,19 @@ from vllm.parser.deepseek_v4 import (
+     _dsml_arg_converter,
+     deepseek_v4_config,
+ )
+-from vllm.parser.engine.parser_engine_config import ParserEngineConfig
++from vllm.parser.engine.parser_engine_config import (
++    ParserEngineConfig,
++    ParserState,
++)
+ 
+ DSML_TOOL_START = "<｜DSML｜ calls>"
+ DSML_TOOL_END = "</｜DSML｜ calls>"
++# Near the context limit the model sometimes writes the outer wrapper without
++# the space or with an underscore. The invoke markers inside are still spelled
++# correctly, so the provisional recovery would still find the call; accepting
++# the near-miss wrapper keeps the stray closing tag out of the reply text.
++DSML_TOOL_START_LENIENT = ("<｜DSML｜calls>", "<｜DSML｜_calls>")
++DSML_TOOL_END_LENIENT = ("</｜DSML｜calls>", "</｜DSML｜_calls>")
+ DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
+ DSML_INVOKE_END = "</｜DSML｜ invoke>"
+ DSML_PARAM_START = "<｜DSML｜ parameter"
+@@ -45,10 +54,26 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+         "PARAM_START": DSML_PARAM_START,
+         "PARAM_CLOSE": DSML_PARAM_CLOSE,
+     }
++    # Lenient wrapper spellings take exactly the transitions of the exact
++    # spelling; they are text-only terminals (never single tokens).
++    transitions = dict(config.transitions)
++    for i, literal in enumerate(DSML_TOOL_START_LENIENT):
++        terminals[f"TOOL_START_LENIENT{i}"] = literal
++        for state in (ParserState.REASONING, ParserState.CONTENT):
++            transitions[(state, f"TOOL_START_LENIENT{i}")] = config.transitions[
++                (state, "TOOL_START")
++            ]
++    for i, literal in enumerate(DSML_TOOL_END_LENIENT):
++        terminals[f"TOOL_END_LENIENT{i}"] = literal
++        for state in (ParserState.TOOL_ARGS, ParserState.TOOL_BETWEEN):
++            transitions[(state, f"TOOL_END_LENIENT{i}")] = config.transitions[
++                (state, "TOOL_END")
++            ]
+     return replace(
+         config,
+         name="deepseek_v41",
+         terminals=terminals,
++        transitions=transitions,
+         token_id_terminals={key: terminals[key] for key in config.token_id_terminals},
+         arg_converter=functools.partial(
+             _dsml_arg_converter,
+-- 
+2.53.0
+

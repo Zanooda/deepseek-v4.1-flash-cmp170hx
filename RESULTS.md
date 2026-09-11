@@ -610,3 +610,244 @@ Each of these produced a wrong number before it was caught:
     attribute felt like a lead; the corpus was a 50/50 split, so p = 0.25 by chance. An effect
     that appears in one stratum and reverses in another is noise — look for replication before
     reporting.
+
+---
+
+## DeepSeek-V4.1-Flash on 8× CMP 170HX
+
+Measured 2026-09-10/11 on the stack described in [patches/README.md](patches/README.md#-2026-09-10-deepseek-v41-flash-series--patchesv41-runs-on-8-cmp-170hx-pp8):
+image `zanooda/vllm-sm80-ds41f:v41-sm80` + patch `v41/0009`, `launch/run-v41-pp8.sh`
+(PP=8, partition 5×8, `--block-size 128`, fp8 KV, breakable CUDA graphs, DSpark 5 tokens,
+**Engram served from disk**, prefix caching left on but every benchmark prompt unique).
+Harnesses: `bench/bench_v41_check.py` (coherence + needles) and `bench/bench_v41_matrix.py`
+(context × concurrency, streaming, `usage`-based token counts, `ignore_eos`, warm-up
+discarded); raw cells in `bench/bench_v41_matrix.jsonl`.
+
+### Correctness
+
+- **Chat coherence 5/5**: factual (Canberra, population), arithmetic (3 h 25 min), code
+  (iterative Fibonacci), multi-turn memory (name + number), tool call (`get_weather`,
+  `{"city": "Lisbon"}`) — all correct, no token salad.
+- **Needles 19/19.** Passphrase buried at 10 %, 50 % and 90 % depth:
+
+| real prompt tokens | 10 % | 50 % | 90 % | time per request |
+|---|---|---|---|---|
+| 3,315 | PASS | PASS | PASS | 5 s |
+| 26,343 | PASS | PASS | PASS | 13 s |
+| 104,938 | PASS | PASS | PASS | 43 s |
+| 420,028 | PASS | PASS | PASS | 172 s |
+| **819,574** | PASS | PASS | PASS | 358 s |
+
+  Plus **4 concurrent 32k needles with distinct passphrases: 4/4, no cross-request bleed**
+  (the test that catches prefill-chunk row/offset mix-ups between requests, and here also
+  the cross-rank cache replication).
+- **KV pool: 2,827,499 tokens** at `--gpu-memory-utilization 0.90` (2.70 × the 1,048,576
+  max model length). The "2M context space" requirement is met at fp8 with no extra
+  quantization.
+- Per-rank resident memory after load: 35.9 GiB (ranks 1–6), 37.6 GiB (rank 0), 46.3 GiB
+  (rank 7: drafter + lm_head). Peak during the 1M runs: 60.4 GiB on rank 7.
+
+### Speed matrix
+
+Real prompt token counts are the server's `usage.prompt_tokens` (the harness targets are
+word counts; "1M" is 1,007,820 tokens). 128 generated tokens per request.
+
+### Prefill (tok/s; per request = prompt tokens / TTFT, aggregate = all prompts / max TTFT)
+
+| real prompt tok | c=1 per-req | c=2 per-req | c=4 per-req | c=8 per-req | c=1 aggregate | c=2 aggregate | c=4 aggregate | c=8 aggregate |
+|---|---|---|---|---|---|---|---|---|
+| 850 | 542 | 458 | 215 | 142 | 542 | 907 | 858 | 1,127 |
+| 6,586 | 1,188 | 766 | 398 | 245 | 1,188 | 1,529 | 1,590 | 1,954 |
+| 26,208 | 2,023 | 1,148 | 612 | 384 | 2,023 | 2,295 | 2,441 | 2,449 |
+| 104,881 | 2,462 | 1,357 | 863 | 611 | 2,462 | 2,540 | 2,512 | 2,533 |
+| 209,738 | 2,500 | 1,565 | 1,068 | 695 | 2,500 | 2,561 | 2,542 | 2,503 |
+| 419,430 | 2,475 | 1,569 | 1,149 | 766 | 2,475 | 2,502 | 2,479 | 2,440 |
+| 1,007,820 | 2,151 | 1,551 | 1,068 | 707 | 2,151 | 2,149 | 2,129 | 2,142 |
+
+### Time to first token (s, worst request in the cell)
+
+| real prompt tok | c=1 | c=2 | c=4 | c=8 |
+|---|---|---|---|---|
+| 850 | 1.6 | 1.9 | 3.9 | 5.9 |
+| 6,586 | 5.5 | 8.6 | 16.6 | 26.9 |
+| 26,208 | 13.0 | 22.9 | 42.9 | 85.7 |
+| 104,881 | 42.6 | 82.6 | 167.0 | 331.2 |
+| 209,738 | 83.9 | 163.8 | 330.0 | 670.7 |
+| 419,430 | 169.5 | 335.3 | 676.9 | 1,376.2 |
+| 1,007,820 | 468.5 | 937.8 | 1,893.3 | 3,764.1 |
+
+### Decode (tok/s; per request = generated tokens / (last − first token), aggregate = sum over requests)
+
+| real prompt tok | c=1 per-req | c=2 per-req | c=4 per-req | c=8 per-req | c=1 aggregate | c=2 aggregate | c=4 aggregate | c=8 aggregate |
+|---|---|---|---|---|---|---|---|---|
+| 850 | 51.5 | 102.8 | 46.9 | 29.8 | 51.5 | 205.6 | 187.6 | 238.3 |
+| 6,586 | 43.3 | 48.1 | 53.4 | 51.5 | 43.3 | 96.1 | 213.7 | 412.3 |
+| 26,208 | 100.4 | 102.2 | 77.5 | 30.3 | 100.4 | 204.5 | 310.0 | 242.5 |
+| 104,881 | 100.9 | 56.4 | 14.6 | 8.5 | 100.9 | 112.8 | 58.4 | 67.7 |
+| 209,738 | 50.2 | 59.4 | 15.2 | 6.4 | 50.2 | 118.8 | 61.0 | 51.0 |
+| 419,430 | 62.1 | 31.8 | 14.7 | 15.8 | 62.1 | 63.6 | 58.7 | 126.0 |
+| 1,007,820 | 355.2 | 31.8 | 89.9 | 10.4 | 355.2 | 63.6 | 359.4 | 83.1 |
+
+
+**How to read it.**
+
+- **Prefill is flat at ~2,450–2,560 tok/s aggregate from 32k to 512k context** and still
+  2,130–2,150 tok/s at 1M — the sparse indexer keeps attention cost bounded, and the
+  candidate-block filter does the same for the indexer itself. Concurrency does not add
+  prefill throughput beyond c=2: prefill is compute-bound on these cards, so c requests
+  simply share the ~2.5k tok/s and each sees c× the latency. Short prompts are
+  ramp-dominated (542 tok/s at 850 tokens).
+- **TTFT** scales linearly: 43 s at 105k, 84 s at 210k, 170 s at 420k, **468 s (7.8 min)
+  at 1,007,820 tokens**. At c=8 the 1M cell needs 63 minutes to reach the last request's
+  first token, and the KV pool (2.83M tokens) admits only two or three 1M requests at
+  once, so the rest queue — that column measures queueing as much as prefill.
+- **Decode on these random-word prompts is not a clean measurement** and the table shows
+  it: DSpark's acceptance depends on how predictable the continuation is, so the same
+  engine reads 43 tok/s at 8k, 100 at 32k and 128k, 50 at 256k, and the 1M c=1/c=4 cells
+  (355 / 90 tok/s) are degenerate repetition being accepted wholesale. Treat the decode
+  columns as an upper-bound sanity check, not the number.
+- **Decode on prose (the honest number)**, greedy, 256 tokens, streaming, same server:
+
+| workload | per request | aggregate |
+|---|---|---|
+| 600-word explanation, short prompt, c=1 | **51.5 tok/s** | 51.5 |
+| summary of a 30k-token document, c=1 | 51.5 tok/s | 51.5 |
+| four 500-word explanations at once, c=4 | 34.6–42.9 tok/s | **156 tok/s** |
+
+  For scale, V4-Flash on 4 cards did 98 tok/s with DSpark and 51 without; V4.1 is a
+  bigger model (16B active in decode vs 13B) on a stack whose DSpark path, Engram gather
+  and cross-rank cache shipping are all first-cut and unprofiled.
+- **Decode appeared to fall off sharply with concurrency at long context** (128k: 101 → 56 → 15 →
+  8.5 tok/s per request for c=1/2/4/8; aggregate does not grow) — **see the 2026-09-11
+  follow-up below: this was prefill interference in the benchmark, not decode scaling.** That is not the case at
+  8k (aggregate 43 → 412 tok/s). Expected culprits, in order: the per-step disk Engram
+  gather (8 sequences × 6 draft positions × 48 rows, Python-threaded `pread`), the
+  ~43 MB per hop of replicated cache rows and candidate blocks crossing PCIe Gen2 x4
+  three times per step, and DSpark verification over long sparse contexts. Untangling
+  them needs profiling; the RAM kit (Engram in pinned memory) removes the first for free.
+
+### 2026-09-11 follow-ups: Engram gather in C (0010), candidate-only indexer (0011)
+
+Two changes after the matrix above, both Python-only and bind-mounted over the image:
+
+- **0010** moved the disk-Engram row gather from a Python `preadv` thread pool (125k
+  syscalls/s, the prefill ceiling) to a runtime-compiled C helper. Prefill at 32k c=1 went
+  1,6xx → 3,255 tok/s and 128k c=1 → 4,832 (`bench/bench_v41_matrix_v2.jsonl`).
+- **0011** scores only the 2,048 candidate blocks on index layers 24/28/32/36 instead of
+  the whole context and then masking (details in
+  [patches/README.md](patches/README.md#v410011--candidate-only-indexer-logits-2026-09-11)).
+  Lossless: scores bit-identical, top-k sets identical against the full path on one card.
+  Per index layer at 64 heads × 128 dim: prefill 64 rows × 131k 2.42 → 0.40 ms; decode 48
+  rows × 131k 2.4 → 0.32 ms; 8 rows × 1M 3.0 → 0.16 ms. Side effect: the KV pool grew
+  from 2,827,499 to 3,151,289 tokens (profiling no longer sees the full-width transient on
+  the last rank). After the change: coherence 5/5, needles 13/13 (32k/128k/512k at three
+  depths, 4 concurrent 32k), 128k c=1 prefill 4,936 tok/s, decode 103 tok/s
+  (`bench/bench_v41_matrix_v3.jsonl`).
+
+**The concurrency "collapse" above was a measurement artifact.** `bench_v41_matrix.py`
+fires c prompts at once and reports each request's decode rate from its own first to last
+token — but at 128k every prefill takes ~21 s and the requests join decode one at a time,
+so the early ones are measured while the later ones' 4096-token prefill chunks occupy
+every step. `bench/bench_v41_decode_window.py` fixes that: long generations, per-chunk
+timestamps, and only 1 s slots in which **no request is still prefilling** and exactly n
+are generating count (`bench/bench_v41_decode_window.jsonl`, patch 0011 engine):
+
+| real prompt tok | streams decoding together | measured for | aggregate tok/s | per stream tok/s |
+|---|---|---|---|---|
+| 26,246 | 8 | 23 s | 452 | 56.5 |
+| 105,101 | 8 | 35 s | 531 | 66 |
+| 105,101 | 4 (tail) | 5 s | 234 | 59 |
+| 419,731 | 4 | 24 s | 411 | 103 |
+
+So eight 128k conversations decode at 66 tok/s each, and four 512k ones at 103 each —
+decode throughput is essentially flat in context length on this stack. The same window
+benchmark was not run on the pre-0011 engine (that needs a restart with
+`VLLM_DSV41_CAND_LOGITS=0`), so the share of these numbers owed to 0011 versus the
+mis-measurement is not separated; the standalone kernel timings put the indexer at
+under 10 % of a 128k c=8 step even before 0011, so most of it is the measurement.
+The single-stream tail of a 3,000-token generation ran at 43–89 tok/s, below the
+103 tok/s of a 128-token generation; not yet understood (per-chunk token scaling in the
+benchmark, or DSpark acceptance drifting late in a word-salad summary).
+
+### 2026-09-11 partition trials (`bench/v41_partition_trial.sh`)
+
+Same benchmark (128k, 128 tokens c=1; 128k c=8 prefill-free decode window), GPU 6 capped
+at 180 W and placed on rank 7 (`DSV41_GPUS=0,1,2,3,4,5,7,6`, see the hardware note below):
+
+| partition | KV pool (tokens) | 128k c=1 decode | 128k c=8 aggregate (per stream) |
+|---|---|---|---|
+| `5,5,5,5,5,5,5,5` (control) | 3,151,289 | 104 tok/s | **532 tok/s** (66.5) |
+| `5,5,5,5,5,5,6,4` | **6,859,213** | 106 tok/s | 479 tok/s (59.9) |
+| `5,5,5,5,5,6,6,3` | — | — | fails: the drafter's aux states come from layers 36–38, so the last rank needs ≥ 4 layers |
+
+The control reproduces the previous day's 531 tok/s within 1 %, so the cap costs nothing and
+the runs are stable. Moving a layer off the last rank makes concurrent decode 10 % slower: the
+drafter + output head cost less than one layer, the pipeline is already balanced at 5 layers per
+rank, and any 6-layer rank becomes the slowest stage. `6,4` is therefore a KV-pool trade (2.2×
+pool for −10 % c=8 throughput), not a speed option. `--gpu-memory-utilization 0.95` is the
+throughput-neutral way to a larger pool (rank 7 is the memory-bound rank; +3 GiB there ≈ 2×
+pool), untested.
+
+**Utilization 0.95 (now the launch default).** Same `5×8`: KV pool **6,171,394 tokens**
+(5.9 × 1M, was 3,151,289), 128k c=1 decode 105.6 tok/s (unchanged), capture and serving fit.
+
+**Why c=8 numbers scatter (274–532 tok/s): micro-batch grouping, not the settings.** With
+pipeline parallelism vLLM's scheduler puts every runnable request into one micro-batch
+(`step_with_batch_queue` → `schedule()` takes all requests not in flight). Requests that
+join one at a time (uncached prompts, sequential 24 s prefills) get their own in-flight
+batch and overlap across the 8 stages: 532 tok/s. Eight requests that become runnable in
+the same step (prefix-cache hits, all prefills done in 49 s) travel the stages as a single
+batch with nothing behind it: 274 tok/s (two runs: 274, 280); 8 s staggered starts: 389.
+Batches only merge (two requests whose batches finish in the same step land in one batch
+from then on) and never split, so sustained load drifts toward the low figure. The 0.95
+trial's 450 and the `6,4` trial's 479 are inside this scatter, so the `6,4` "−10 %" above
+is not established either. Fix candidate: a scheduler patch that spreads runnable requests
+over the in-flight micro-batches (round-robin, ≤ ⌈running / queue depth⌉ per batch).
+`--max-num-seqs` is not that knob: it bounds the total running requests (1 → "Running: 1,
+Waiting: 7"). Per-stream tok/s also varies 2× with DSpark acceptance (5.9 vs 3.9 tokens per
+step on different word-salad prompts) at a constant ~16 steps/s; the "slow tail" in the
+window runs is the lowest-acceptance request finishing last, not a slowdown with length
+(single stream is flat at 97–101 tok/s over 3,000 tokens).
+
+**P2P enabled (2026-09-11, cmpunlocker BAR1 P2P, kernel 7.0.14-cmp, `RMForceStaticBar1=1;RMPcieP2PType=1`,
+64 GiB BAR1 per card).** Peer copies verified correct at 1.55 GB/s for same-switch and
+cross-switch pairs (the Gen2 x4 link speed). With `NCCL_P2P_LEVEL=SYS` every pipeline hop
+takes `P2P/CUMEM` (NCCL log), including the three cross-switch hops. Effect on the same
+benchmark: 128k c=1 TTFT 23.5 s (was 23.6–24.5), decode 104 tok/s (was 104–106), 128k c=8
+514 tok/s (was 532, inside the micro-batch scatter). **No measurable change**, as predicted:
+the hops are bound by the receiving card's link bandwidth, which P2P does not raise; it
+only removes the host bounce. `launch/run-v41-pp8.sh` passes any `NCCL_*` variables through.
+
+**Engram in host RAM (2026-09-11, after the upgrade to 278 GB).** `storage=cpu` OOM-killed the
+two table-owning workers three times: torch's pinned allocator rounds each 98.3 GB table to a
+128 GiB block, and the generic loader materialises a second 98 GB copy before `copy_()`.
+Patch 0013 (exact-size `cudaHostRegister`, direct chunked fill from the shard) brings the
+steady state to ~217 GB used. Same benchmark, single stream, cold prefix cache:
+
+| prompt tokens | Engram from NVMe (TTFT / prefill) | shards in page cache | pinned in RAM (0013) |
+|---|---|---|---|
+| 26,208 | 8.1 s / 3,255 tok/s | 6.65 s / 3,942 | **5.84 s / 4,486** |
+| 104,881 | 21.3–23.5 s / 4,455–4,930 | — (cache hit, n/a) | **17.3 s / 6,066** |
+| 419,430 | 88–106 s / 3,965–4,780 | 80.3 s / 5,223 | **78.7 s / 5,328** |
+
+Decode at c=1: 128k 104–109 → **117 tok/s**, 512k 86 → **96** (`bench/bench_v41_matrix_v4.jsonl`). 128k c=8 window 460 tok/s
+(inside the micro-batch scatter, 450–532), with all eight prefills done in 143 s instead of
+175–190 s. Needles 3/3 at 128k on the pinned path. Both tables load in 89 s and 98 s.
+The page-cache variant (`launch/warm-engram-cache.sh`, disk mode) reaches ~80 % of the
+gain without pinning and stays the option for hosts between 210 and 240 GB.
+
+**Hardware note.** GPU 6 (PCI `0000:c3:00.0`, serial 1322321007408) fell off the bus (Xid 79)
+three times on 2026-09-11 under sustained load: weight loading with 6 layers, c=8 decode with
+6 layers, and 5 s into `memtest_vulkan` at 914 GB/s. Memory verified clean (45 iterations ×
+58 GB, no mismatches); at a 180 W power cap the same memtest ran 5 minutes and the trials
+above completed. Power delivery on that card, then. The cap is re-applied at boot by
+`/etc/systemd/system/gpu6-power-cap.service`. Caveat: `nvidia-smi` power readings exceed the
+software limits on every card during prefill (up to 333 W against 250 W), so whether the CMP
+firmware truly enforces the cap or merely reports inflated draw is unresolved.
+
+### What the run cost
+
+The port ran on the first try at the kernel level: no CUDA kernel, Marlin path or Triton
+fp8 substitution needed a change after the build. What needed eight launch iterations
+was integration — all of it Python and all of it now in `patches/v41/0009`
+(see [patches/README.md](patches/README.md#v410009--what-the-first-engine-start-needed)).

@@ -1,0 +1,917 @@
+From 68de681be340b2d47002490d3e3f4c87e012316b Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <daniel.storozhev@gmail.com>
+Date: Thu, 10 Sep 2026 07:42:39 +0000
+Subject: [PATCH 08/13] DeepSeek V4.1 on SM8x: Triton sparse-MLA attention
+ (ROCm path on Ampere), software fp8 in the V4.1 cache/indexer/engram kernels,
+ wo_a bf16 dequant hook, Engram storage modes incl. disk-backed tables staged
+ by the model-state hook
+
+---
+ vllm/config/engram.py                         |  26 +-
+ .../layers/quantization/modelopt.py           |  15 +
+ .../model_loader/weight_utils.py              |  27 +-
+ vllm/models/deepseek_v4_1/ampere/__init__.py  |   2 +
+ .../deepseek_v4_1/ampere/ampere_sparse.py     |  56 ++++
+ vllm/models/deepseek_v4_1/common/engram.py    | 298 +++++++++++++++++-
+ .../deepseek_v4_1/common/ops/cache_utils.py   |  25 +-
+ .../common/ops/fused_compress_quant_cache.py  |  14 +-
+ .../common/ops/indexer_k_store.py             |   3 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  69 +++-
+ .../deepseek_v4_1/nvidia/model_state.py       |  19 ++
+ vllm/v1/attention/backends/registry.py        |   4 +
+ .../v1/attention/ops/rocm_aiter_mla_sparse.py |   2 +-
+ 13 files changed, 526 insertions(+), 34 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/ampere/__init__.py
+ create mode 100644 vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index a3749c6d9f..aed1e0d6e3 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Literal
+ 
+ from vllm.config.utils import config, get_hash_factors, hash_factors
+ from vllm.logger import init_logger
+@@ -25,7 +25,29 @@ class EngramConfig:
+     cpu_offload: bool = True
+     """Store embedding weights in pinned CPU memory for UVA lookup.
+     Each rank offloads its assigned hash heads, so host table storage and
+-    lookup traffic scale with the number of heads assigned to the rank."""
++    lookup traffic scale with the number of heads assigned to the rank.
++    Ignored when ``storage`` is set explicitly."""
++
++    storage: Literal["cpu", "gpu", "disk"] | None = None
++    """Where the n-gram hash tables live. ``cpu``: pinned host memory read
++    over UVA (the ``cpu_offload=True`` default; ~203 GiB of host RAM for
++    DeepSeek V4.1). ``gpu``: resident in device memory (``cpu_offload=False``;
++    ~98 GiB per engram layer, on the PP rank that owns it). ``disk``: the
++    tables are never loaded -- rows are gathered per step straight from the
++    safetensors shards with many parallel ``pread`` calls, dequantized on the
++    GPU. Zero VRAM/RAM for the tables at the cost of NVMe random-read latency
++    per step; the only option on hosts without ~200 GiB of RAM (e.g. 8x64 GB
++    SM8x boxes with 32 GB of host memory). Needs a local checkpoint directory
++    and the default (lazy) safetensors load strategy."""
++
++    disk_threads: int = 32
++    """Reader threads for ``storage="disk"``. Each row is a 256-byte random
++    read; NVMe queue depth is what makes the gather fast, so keep this high."""
++
++    def resolved_storage(self) -> str:
++        if self.storage is not None:
++            return self.storage
++        return "cpu" if self.cpu_offload else "gpu"
+ 
+     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
+         """Reject Engram configuration for models without n-gram embeddings."""
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index 015fb18fb5..f91f50982f 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -2441,6 +2441,21 @@ class ModelOptLinearMethod(LinearMethodBase):
+         self.fmt.post_process(layer)
+         if self.spec.weight == kMxfp8Static and getattr(layer, "is_bmm", False):
+             self.kernel = init_mxfp8_linear_kernel(bmm_batch_size=layer.bmm_batch_size)
++        elif self.spec.weight == kMxfp8Static and getattr(
++            layer, "mxfp8_dequant_to_bf16", False
++        ):
++            # Layer asked for a plain bf16 [N, K] weight after load (its
++            # forward reads the weight directly rather than through
++            # apply()); e.g. DeepSeek V4.1 wo_a on the SM8x einsum path,
++            # where the Marlin repack would destroy the layout it needs.
++            from vllm.model_executor.kernels.linear.mxfp8 import (
++                Mxfp8LinearLayerConfig,
++            )
++            from vllm.model_executor.kernels.linear.mxfp8.emulation import (
++                EmulationMxfp8LinearKernel,
++            )
++
++            self.kernel = EmulationMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+         self.kernel.process_weights_after_loading(layer)
+ 
+     def apply(self, layer, x, bias=None):
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index c8b166d134..96c0ae2afa 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -831,6 +831,22 @@ def _prefetch_all_checkpoints(
+     threading.Thread(target=_run_prefetch, daemon=True).start()
+ 
+ 
++# Tensor names the safetensors iterators must never materialize. Registered
++# by modules that source a tensor themselves at runtime (e.g. DeepSeek V4.1
++# Engram tables with ``--engram-config '{"storage": "disk"}'``: two 98 GiB
++# tensors that ``safe_open().get_tensor`` would otherwise copy into host RAM).
++_SKIP_WEIGHT_NAMES: set[str] = set()
++
++
++def register_skip_weight_names(names) -> None:
++    """Skip these checkpoint tensor names in the safetensors iterators."""
++    _SKIP_WEIGHT_NAMES.update(names)
++
++
++def _skip_registered_weight(name: str) -> bool:
++    return bool(_SKIP_WEIGHT_NAMES) and name in _SKIP_WEIGHT_NAMES
++
++
+ def safetensors_weights_iterator(
+     hf_weights_files: list[str],
+     use_tqdm_on_load: bool,
+@@ -927,8 +943,11 @@ def safetensors_weights_iterator(
+             with open(st_file, "rb") as f:
+                 state_dict = load(f.read())
+             for name, param in state_dict.items():
+-                if not should_skip_weight(name, local_expert_ids):
+-                    yield name, param
++                if should_skip_weight(name, local_expert_ids):
++                    continue
++                if _skip_registered_weight(name):
++                    continue
++                yield name, param
+         elif safetensors_load_strategy == "torchao":
+             # we can't load flattened torchao tensor subclasses directly into the model
+             # instead we reconstruct the subclasses here before returning
+@@ -946,6 +965,8 @@ def safetensors_weights_iterator(
+                 for name in f.keys():  # noqa: SIM118
+                     if should_skip_weight(name, local_expert_ids):
+                         continue
++                    if _skip_registered_weight(name):
++                        continue
+                     state_dict[name] = f.get_tensor(name)
+ 
+                 # update with leftover tensor data from previous iteration, if any
+@@ -964,6 +985,8 @@ def safetensors_weights_iterator(
+                 for name in f.keys():  # noqa: SIM118
+                     if should_skip_weight(name, local_expert_ids):
+                         continue
++                    if _skip_registered_weight(name):
++                        continue
+                     param = f.get_tensor(name)
+                     yield name, param
+ 
+diff --git a/vllm/models/deepseek_v4_1/ampere/__init__.py b/vllm/models/deepseek_v4_1/ampere/__init__.py
+new file mode 100644
+index 0000000000..208f01a7cb
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/ampere/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+new file mode 100644
+index 0000000000..464aacbfcd
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 sparse MLA attention for SM8x (Ampere: A100/A800/CMP 170HX).
++
++Same construction as ``deepseek_v4/ampere``: the ROCm Triton sparse-MLA
++implementation is reused wholesale. Its kernels, ragged metadata builders and
++the bf16 ``rocm_inv_rope_einsum`` o_proj path are plain Triton/torch (the
++aiter-only preshuffle GEMMs self-disable off ROCm), and
++``vllm.v1.attention.ops.fp8_sm80`` supplies e4m3 encode/decode below SM89
++where Triton refuses native fp8 converts.
++
++What differs from the V4 Ampere layer is inherited from the V4.1 ROCm class:
++ratio-0/1/2 layer types, KV sharing through ``kv_source_layer_ids`` (the
++consumer reads the source layer's compressed cache and metadata), the
++two-level candidate-block filtering, and the indexer-K-from-latent store.
++
++The dense projections of the V4.1 checkpoint are MXFP8 (``[32, 32]`` blocks,
++UE8M0 scales). On SM8x they run through Marlin W8A16 (upstream
++``MarlinMxfp8LinearKernel``, sm_75+). ``wo_a`` is the exception: the einsum
++o_proj reads the raw ``[N, K]`` weight, which a Marlin repack would destroy,
++so it is dequantized to bf16 once at load instead (``mxfp8_dequant_to_bf16``,
++honoured by ``ModelOptLinearMethod.process_weights_after_loading``).
++"""
++
++from vllm.models.deepseek_v4_1.amd.rocm import (
++    DeepseekV4ROCMAiterMLASparseBackend,
++    DeepseekV41ROCMAiterMLAAttention,
++)
++from vllm.platforms.interface import DeviceCapability
++
++
++class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_MLA_SPARSE_DSV41"
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major == 8
++
++
++class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
++    """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
++
++    backend_cls = DeepseekV41AmpereMLASparseBackend
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # The ROCm parent already cleared ``wo_a.is_bmm`` so the ordinary
++        # MXFP8 linear method owns the layer. On SM8x that method's kernel
++        # walk lands on Marlin, whose repack replaces ``weight`` with the
++        # Marlin tile layout -- but ``rocm_inv_rope_einsum`` reads the plain
++        # ``[N, K]`` weight (+ E8M0 scale) to build its cached bf16 copy.
++        # Ask for the emulation kernel instead: it dequantizes the weight to
++        # bf16 in place at load, and the einsum helper then uses it as is.
++        self.wo_a.mxfp8_dequant_to_bf16 = True
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index f30c3a5606..ac2886c7a0 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -34,6 +34,11 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
+   cache for the rest.
+ """
+ 
++import concurrent.futures
++import json
++import os
++import re
++import struct
+ import weakref
+ 
+ import numpy as np
+@@ -53,6 +58,7 @@ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.platform_utils import is_uva_available
+ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+ 
+ logger = init_logger(__name__)
+ 
+@@ -583,7 +589,10 @@ def _engram_lookup_kernel(
+     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
+ 
+     Only this rank's heads are read; padded heads write zeros for all-gather.
+-    `weight`/`scales` may address pinned host memory through UVA.
++    `weight`/`scales` may address pinned host memory through UVA. `weight`
++    is the e4m3 table viewed as uint8: Triton has no fp8 convert below SM89,
++    so the bytes are decoded by ``_decode_fp8_f32`` (hardware convert where
++    it exists, ALU decode on SM8x).
+     """
+     cols = tl.arange(0, DIM)
+     scale_cols = cols // QUANT_BLOCK
+@@ -600,11 +609,12 @@ def _engram_lookup_kernel(
+         owned = valid & (head < TOTAL_HEADS)
+         owned &= (index >= vocab_start) & (index < vocab_end)
+         local = tl.where(owned, index - vocab_start, 0)
+-        values = tl.load(
++        values_u8 = tl.load(
+             weight + local[:, None] * DIM + cols[None, :],
+             mask=owned[:, None],
+-            other=0.0,
++            other=0,
+         )
++        values = _decode_fp8_f32(values_u8, False)
+         scale = tl.load(
+             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
+             mask=owned[:, None],
+@@ -614,11 +624,190 @@ def _engram_lookup_kernel(
+         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+         tl.store(
+             out + rows[:, None] * DIM + cols[None, :],
+-            (values.to(tl.float32) * scale).to(tl.bfloat16),
++            (values * scale).to(tl.bfloat16),
+             mask=valid[:, None],
+         )
+ 
+ 
++_ENGRAM_EMBED_KEY_RE = re.compile(r"(layers\.\d+\.engram)\b")
++
++
++def _hf_engram_prefix(prefix: str) -> str:
++    """``model.layers.1.engram`` (vLLM prefix) -> ``layers.1.engram`` (checkpoint)."""
++    m = _ENGRAM_EMBED_KEY_RE.search(prefix)
++    if m is None:
++        raise ValueError(f"cannot derive the checkpoint engram key from {prefix!r}")
++    return m.group(1)
++
++
++class _DiskEngramTable:
++    """Rows of one engram table gathered straight from the safetensors shard.
++
++    ``storage="disk"``: nothing of the ~98 GiB table is ever loaded. A lookup
++    takes the batch's hash ids to the host, deduplicates them, reads each
++    unique row (256 e4m3 bytes + 8 UE8M0 scale bytes) with ``pread`` from a
++    thread pool -- NVMe queue depth is what makes this fast -- into pinned
++    staging buffers, copies them to the device and dequantizes there with the
++    same Triton kernel the resident tables use (the staged rows are simply a
++    tiny table addressed by the inverse-unique index).
++
++    Costs: one device sync per lookup (the ids must reach the host) and NVMe
++    random-read latency, both once per step per engram layer. Meant for the
++    eager model-state hook that runs before the forward, never inside a
++    captured CUDA graph.
++    """
++
++    HEADER_PREFIX = 8  # safetensors: u64 header length, then the JSON header
++
++    def __init__(
++        self,
++        model_path: str,
++        hf_prefix: str,
++        num_embeddings: int,
++        dim: int,
++        block_size: int,
++        vocab_start: int,
++        vocab_end: int,
++        num_threads: int,
++        device: torch.device,
++        staging_rows: int,
++    ) -> None:
++        if not os.path.isdir(model_path):
++            raise ValueError(
++                "engram storage='disk' needs a local checkpoint directory "
++                f"(got {model_path!r}); download the checkpoint first."
++            )
++        self.dim = dim
++        self.scale_dim = dim // block_size
++        self.vocab_start = vocab_start
++        self.vocab_end = vocab_end
++        self.num_threads = max(1, num_threads)
++        self.device = device
++        self.weight_key = f"{hf_prefix}.embed.weight"
++        self.scale_key = f"{hf_prefix}.embed.scale"
++        (self.weight_path, self.weight_base) = self._locate(
++            model_path, self.weight_key, (num_embeddings, dim), "F8_E4M3"
++        )
++        (self.scale_path, self.scale_base) = self._locate(
++            model_path, self.scale_key, (num_embeddings, self.scale_dim), "F8_E8M0"
++        )
++        self._fds: dict[str, int] = {}
++        # Pinned host + device staging for at most ``staging_rows`` unique
++        # rows per lookup (batch tokens x local hash columns). ~26 MiB each
++        # at 4096 x 24 rows.
++        self.capacity = max(1, staging_rows)
++        self.host_vals = torch.empty(
++            (self.capacity, dim), dtype=torch.uint8, pin_memory=True
++        )
++        self.host_scales = torch.empty(
++            (self.capacity, self.scale_dim), dtype=torch.uint8, pin_memory=True
++        )
++        self.dev_vals = torch.empty((self.capacity, dim), dtype=torch.uint8, device=device)
++        self.dev_scales = torch.empty(
++            (self.capacity, self.scale_dim), dtype=torch.uint8, device=device
++        )
++        self._np_vals = self.host_vals.numpy()
++        self._np_scales = self.host_scales.numpy()
++        self._pool = concurrent.futures.ThreadPoolExecutor(self.num_threads)
++        logger.info(
++            "Engram table %s served from disk (%s, %.1f GiB never loaded); "
++            "%d reader threads, staging %d rows",
++            hf_prefix,
++            os.path.basename(self.weight_path),
++            num_embeddings * (dim + self.scale_dim) / 1024**3,
++            self.num_threads,
++            self.capacity,
++        )
++
++    @staticmethod
++    def _locate(
++        model_path: str, key: str, shape: tuple[int, int], dtype: str
++    ) -> tuple[str, int]:
++        index_path = os.path.join(model_path, "model.safetensors.index.json")
++        shard = None
++        if os.path.exists(index_path):
++            with open(index_path) as f:
++                shard = json.load(f)["weight_map"].get(key)
++        candidates = (
++            [os.path.join(model_path, shard)]
++            if shard is not None
++            else sorted(
++                os.path.join(model_path, f)
++                for f in os.listdir(model_path)
++                if f.endswith(".safetensors")
++            )
++        )
++        for path in candidates:
++            with open(path, "rb") as f:
++                (header_len,) = struct.unpack("<Q", f.read(8))
++                header = json.loads(f.read(header_len))
++            meta = header.get(key)
++            if meta is None:
++                continue
++            if tuple(meta["shape"]) != tuple(shape) or meta["dtype"] != dtype:
++                raise ValueError(
++                    f"{key} in {path} is {meta['dtype']} {meta['shape']}, expected "
++                    f"{dtype} {list(shape)}"
++                )
++            start, end = meta["data_offsets"]
++            assert end - start == shape[0] * shape[1], (key, start, end, shape)
++            return path, _DiskEngramTable.HEADER_PREFIX + header_len + start
++        raise ValueError(f"{key} not found in the safetensors shards under {model_path}")
++
++    def _fd(self, path: str) -> int:
++        fd = self._fds.get(path)
++        if fd is None:
++            fd = os.open(path, os.O_RDONLY)
++            self._fds[path] = fd
++        return fd
++
++    def _read_rows(self, rows: np.ndarray) -> None:
++        """Fill host staging rows [0, len(rows)) with table rows ``rows``."""
++        n = len(rows)
++        if n == 0:
++            return
++        wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
++        vals, scales = self._np_vals, self._np_scales
++        dim, sdim = self.dim, self.scale_dim
++        wbase, sbase = self.weight_base, self.scale_base
++
++        def work(lo: int, hi: int) -> None:
++            for i in range(lo, hi):
++                r = int(rows[i])
++                os.preadv(wfd, [memoryview(vals[i])], wbase + r * dim)
++                os.preadv(sfd, [memoryview(scales[i])], sbase + r * sdim)
++
++        step = max(64, -(-n // self.num_threads))
++        futures = [
++            self._pool.submit(work, lo, min(lo + step, n)) for lo in range(0, n, step)
++        ]
++        for fut in futures:
++            fut.result()
++
++    def gather(
++        self, indices: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
++        """indices: [T, local_heads] global hash ids -> (dev_vals, dev_scales,
++        inverse ids [T, local_heads] int32 (-1 = not owned), num_unique)."""
++        ids = indices.to("cpu", torch.int64).numpy()  # one sync per lookup
++        local = ids - self.vocab_start
++        valid = (local >= 0) & (local < self.vocab_end - self.vocab_start)
++        uniq, inv = np.unique(local[valid], return_inverse=True)
++        n = len(uniq)
++        if n > self.capacity:
++            raise RuntimeError(
++                f"engram disk staging too small: {n} unique rows > {self.capacity}"
++            )
++        self._read_rows(uniq)
++        inv_ids = np.full(ids.shape, -1, dtype=np.int32)
++        inv_ids[valid] = inv.astype(np.int32)
++        if n > 0:
++            self.dev_vals[:n].copy_(self.host_vals[:n], non_blocking=True)
++            self.dev_scales[:n].copy_(self.host_scales[:n], non_blocking=True)
++        inv_dev = torch.from_numpy(inv_ids).to(self.device, non_blocking=True)
++        return self.dev_vals, self.dev_scales, inv_dev, n
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """The n-gram hash table, sharded by complete hash heads over TP ranks.
+     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+@@ -634,8 +823,16 @@ class ParallelEngramEmbedding(nn.Module):
+         head_sizes: tuple[int, ...],
+         block_size: int = 32,
+         cpu_offload: bool = False,
++        storage: str | None = None,
++        hf_prefix: str | None = None,
++        disk_threads: int = 32,
++        staging_rows: int | None = None,
+     ):
+         super().__init__()
++        if storage is None:
++            storage = "cpu" if cpu_offload else "gpu"
++        assert storage in ("cpu", "gpu", "disk"), storage
++        cpu_offload = storage == "cpu"
+         tp_size = get_tensor_model_parallel_world_size()
+         tp_rank = get_tensor_model_parallel_rank()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+@@ -654,12 +851,47 @@ class ParallelEngramEmbedding(nn.Module):
+         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
+         self.tp_size = tp_size
+         self.cpu_offload = cpu_offload
++        self.storage = storage
+         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+         self._view_src: tuple[int, int] | None = None
+         self._num_sms = torch.cuda.get_device_properties(
+             torch.accelerator.current_device_index()
+         ).multi_processor_count
+ 
++        if storage == "disk":
++            # No parameters at all: the loader never sees these tensors (they
++            # are registered as skipped by name), the "weights not
++            # initialized" check has nothing to miss, and rows are gathered
++            # from the shard per step (see _DiskEngramTable).
++            assert hf_prefix is not None
++            from vllm.model_executor.model_loader.weight_utils import (
++                register_skip_weight_names,
++            )
++
++            register_skip_weight_names(
++                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
++            )
++            self.weight = None
++            self.weight_scale_inv = None
++            vllm_config = get_current_vllm_config()
++            self.disk = _DiskEngramTable(
++                vllm_config.model_config.model,
++                hf_prefix,
++                num_embeddings,
++                dim,
++                block_size,
++                self.vocab_start_idx,
++                self.vocab_end_idx,
++                disk_threads,
++                torch.device(torch.accelerator.current_device_index()),
++                staging_rows
++                if staging_rows is not None
++                else vllm_config.scheduler_config.max_num_batched_tokens
++                * self.part_n_hash_cols,
++            )
++            return
++        self.disk = None
++
+         # Explicit device: model init runs under a `torch.device("cuda")`
+         # context, which would otherwise put the shard in HBM.
+         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+@@ -701,12 +933,16 @@ class ParallelEngramEmbedding(nn.Module):
+         Rebuilt if anything swaps `.data`, so a stale device pointer cannot
+         survive silently.
+         """
++        # The lookup kernel takes the e4m3 table as bytes (no fp8 convert
++        # below SM89); a uint8 view shares storage, so nothing is copied.
+         if not self.cpu_offload:
+-            return self.weight.data, self.weight_scale_inv.data
++            return self.weight.data.view(torch.uint8), self.weight_scale_inv.data
+         src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr())
+         if self._view_src != src:
+             self._views = (
+-                get_accelerator_view_from_cpu_tensor(self.weight.data),
++                get_accelerator_view_from_cpu_tensor(
++                    self.weight.data.view(torch.uint8)
++                ),
+                 get_accelerator_view_from_cpu_tensor(self.weight_scale_inv.data),
+             )
+             self._view_src = src
+@@ -723,6 +959,9 @@ class ParallelEngramEmbedding(nn.Module):
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if self.disk is not None:
++            self._lookup_from_disk(indices, out, background)
++            return
+         weight, scales = self._storage()
+         # The table dwarfs TLB reach, so a persistent grid near the SM count
+         # beats one program per row; halve it to leave SMs for the main stream.
+@@ -747,6 +986,42 @@ class ParallelEngramEmbedding(nn.Module):
+             GRID=grid,
+         )
+ 
++    def _lookup_from_disk(
++        self, indices: torch.Tensor, out: torch.Tensor, background: bool
++    ) -> None:
++        """``storage="disk"``: stage the batch's unique rows from the shard,
++        then run the ordinary lookup kernel over that staged mini-table with
++        the inverse-unique ids (padded/unowned heads map to -1 -> zeros)."""
++        assert self.disk is not None
++        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
++        local = indices[:, self.head_start : head_end]
++        vals, scales, inv_ids, num_unique = self.disk.gather(local)
++        if inv_ids.shape[1] != self.part_n_hash_cols:
++            padded = inv_ids.new_full((inv_ids.shape[0], self.part_n_hash_cols), -1)
++            padded[:, : inv_ids.shape[1]] = inv_ids
++            inv_ids = padded
++        rows = indices.shape[0] * self.part_n_hash_cols
++        tiles = triton.cdiv(rows, 16)
++        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
++        _engram_lookup_kernel[(grid,)](
++            vals,
++            scales,
++            inv_ids,
++            out,
++            0,
++            num_unique,
++            rows,
++            inv_ids.stride(0),
++            inv_ids.stride(1),
++            HEAD_START=0,
++            LOCAL_HEADS=self.part_n_hash_cols,
++            TOTAL_HEADS=self.part_n_hash_cols,
++            DIM=self.dim,
++            QUANT_BLOCK=self.block_size,
++            BLOCK_R=16,
++            GRID=grid,
++        )
++
+     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
+         bf16, gathered from all TP shards."""
+@@ -911,7 +1186,9 @@ class Engram(nn.Module):
+             layout.num_embeddings[layer_hash_index],
+             layout.head_dim,
+             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+-            cpu_offload=engram_config.cpu_offload if engram_config else True,
++            storage=engram_config.resolved_storage() if engram_config else "cpu",
++            hf_prefix=_hf_engram_prefix(prefix),
++            disk_threads=engram_config.disk_threads if engram_config else 32,
+         )
+         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+         self.wkv = ReplicatedLinear(
+@@ -940,6 +1217,13 @@ class Engram(nn.Module):
+             dtype=torch.bfloat16,
+         )
+ 
++    @property
++    def rows_staged_by_runner(self) -> bool:
++        """``storage="disk"``: rows are gathered by the model-state hook before
++        the forward (host round trip; illegal inside graph capture), so the
++        forward must not call :meth:`prepare_embeddings` itself."""
++        return self.embed_tokens.storage == "disk"
++
+     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+         """Gather this layer's rows on the main stream before decoder layers."""
+         self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+diff --git a/vllm/models/deepseek_v4_1/common/ops/cache_utils.py b/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
+index e2da6f5e2b..7b838252f5 100644
+--- a/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
+@@ -33,7 +33,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+-from vllm.utils.import_utils import has_cutedsl
++from vllm.utils.import_utils import is_cutedsl_supported
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
+ from vllm.utils.math_utils import next_power_of_2
+ 
+ 
+@@ -133,12 +134,9 @@ def quantize_and_insert_k_kernel(
+             x_scaled = x / scale
+             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+ 
+-            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+-            if use_fnuz:
+-                x_fp8 = x_clamped.to(tl.float8e4b8)
+-            else:
+-                x_fp8 = x_clamped.to(tl.float8e4nv)
+-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere) as raw bytes;
++            # software RNE encoder below SM89 (vllm/v1/attention/ops/fp8_sm80.py).
++            x_uint8 = _encode_fp8_u8(x_clamped, use_fnuz)
+ 
+             # Store as uint8 (1 byte each)
+             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+@@ -309,14 +307,9 @@ def _dequantize_and_gather_k_kernel(
+                 # Load quantized fp8 values (stored as uint8)
+                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+ 
+-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+-                if use_fnuz:
+-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-                else:
+-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+-
+-                # Convert fp8 to float32 for computation
+-                x_float = x_fp8.to(tl.float32)
++                # Decode fp8 bytes (FNUZ on gfx942, OCP elsewhere) to f32;
++                # ALU decode below SM89 where Triton has no native convert.
++                x_float = _decode_fp8_f32(x_uint8, use_fnuz)
+ 
+                 # Load and decode UE8M0 scale
+                 # UE8M0: scale = 2^(stored_value - 127)
+@@ -413,7 +406,7 @@ def dequantize_and_gather_k_cache(
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl():
++    if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             dequantize_and_gather_k_cache_cutedsl,
+diff --git a/vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py
+index 5950c4b6ba..296a498d23 100644
+--- a/vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py
+@@ -6,6 +6,7 @@ import torch
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+ 
+ if current_platform.is_rocm():
+     from vllm.platforms.rocm import _ON_GFX950
+@@ -273,7 +274,9 @@ def rope_quant_insert(
+         latent,
+         positions,
+         cos_sin_cache,
+-        kv_cache,
++        # fp8 caches are addressed as bytes: the kernel encodes e4m3 itself
++        # (software encoder below SM89) and stores raw uint8.
++        kv_cache.view(torch.uint8) if store_fp8 else kv_cache,
+         slot_mapping,
+         fp8_scale if store_fp8 else None,
+         COS_STRIDE=cos_sin_cache.stride(0),
+@@ -317,8 +320,9 @@ def _rope_quant_insert_kernel(
+     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
+     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
+     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
+-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
+-    packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
++    # e4m3 encode as bytes (software RNE encoder below SM89).
++    fp8_u8 = _encode_e4m3fn_u8(tl.clamp(scaled, -448.0, 448.0))
++    packed = tl.reshape(fp8_u8, (512,))
+     tl.store(values + d, packed, d < 448)
+     s = tl.arange(0, 8)
+     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
+@@ -378,6 +382,8 @@ def _rope_plain_insert_kernel(
+     )
+     if STORE_FP8:
+         scaled = row.to(tl.float32) * (1.0 / tl.load(fp8_scale))
+-        tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
++        # ``dst`` is the fp8 cache viewed as bytes (see caller); the software
++        # encoder keeps this store legal below SM89.
++        tl.store(dst + d, _encode_e4m3fn_u8(tl.clamp(scaled, -448.0, 448.0)))
+     else:
+         tl.store(dst + d, row)
+diff --git a/vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py b/vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py
+index c4bd98b9e9..17b7fa02f1 100644
+--- a/vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py
++++ b/vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py
+@@ -17,6 +17,7 @@ import torch
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+ 
+ from . import MXFP4_BLOCK_SIZE, _fp32x2_to_fp4x2
+ 
+@@ -241,7 +242,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
+         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
+         inv_scale = tl.exp2(-exponent)
+         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
+-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++        x_uint8 = _encode_e4m3fn_u8(x_clamped)
+         if SHUFFLE:
+             tiled = (
+                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 6d803736ec..16f7400888 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -121,6 +121,31 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
+     """
+     backend = vllm_config.attention_config.backend
+     device_capability = current_platform.get_device_capability()
++    if device_capability is not None and device_capability.major == 8:
++        # SM8x (A100/A800/CMP 170HX): no FlashMLA, FlashInfer sparse MLA,
++        # DeepGEMM or cuteDSL. Route through the Triton sparse-MLA path
++        # (the ROCm implementation on CUDA), mirroring the V4 Ampere layer.
++        if backend is not None and backend not in (
++            AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41,
++            AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4,
++        ):
++            raise ValueError(
++                f"{backend.name} is not supported for DeepSeek V4.1 on SM8x; "
++                "use TRITON_MLA_SPARSE_DSV41 (or leave the backend unset)."
++            )
++        if getattr(vllm_config.attention_config, "indexer_kv_dtype", None) in (
++            "mxfp4",
++            "fp4",
++        ):
++            raise ValueError(
++                "The MXFP4 indexer K cache needs SM100; use the fp8 indexer "
++                "cache on SM8x."
++            )
++        from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
++            DeepseekV41AmpereMLAAttention,
++        )
++
++        return DeepseekV41AmpereMLAAttention
+     if backend in (
+         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+@@ -530,6 +555,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             }
+         )
+ 
++    @property
++    def has_disk_engram(self) -> bool:
++        """Any local engram layer whose table is served from disk."""
++        return self.engram_hash is not None and any(
++            getattr(layer, "engram", None) is not None
++            and layer.engram.rows_staged_by_runner
++            for layer in islice(self.layers, self.start_layer, self.end_layer)
++        )
++
++    def stage_engram_rows(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        lookback_token_ids: torch.Tensor,
++    ) -> None:
++        """Runner-side (eager, pre-forward) row staging for disk-backed engram
++        tables: recompute the batch's n-gram hashes from the same inputs the
++        forward will see and gather the rows into each layer's ``staged_rows``.
++        The forward then reads them in place, so nothing here has to survive
++        CUDA graph capture. Only the V2 runner (no slot cache) calls this."""
++        assert self.engram_hash is not None
++        if not self.engram_hash.ensure_cache():
++            return  # KV cache unbound (profile run): the forward skips engram too
++        image_mask = image_sentinel_mask(input_ids)
++        engram_hashes = self.engram_hash(
++            input_ids,
++            positions,
++            query_start_loc,
++            image_mask,
++            lookback_token_ids,
++            image_sentinel_mask(lookback_token_ids),
++            None,
++            None,
++        )
++        for layer in islice(self.layers, self.start_layer, self.end_layer):
++            engram = getattr(layer, "engram", None)
++            if engram is not None and engram.rows_staged_by_runner:
++                engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+@@ -595,9 +660,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     swa_metadata.block_table,
+                 )
+                 # Gather all Engram rows before entering the decoder layers.
++                # Disk-backed tables were staged by the model-state hook
++                # (stage_engram_rows) before this forward began.
+                 for layer in islice(self.layers, self.start_layer, self.end_layer):
+                     engram = getattr(layer, "engram", None)
+-                    if engram is not None:
++                    if engram is not None and not engram.rows_staged_by_runner:
+                         engram.prepare_embeddings(
+                             engram_hashes[:, engram.layer_hash_index]
+                         )
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 1ba0f41603..2b806241e1 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -66,6 +66,18 @@ class DeepseekV41ModelState(DefaultModelState):
+             self.lookback_token_ids = torch.full(
+                 (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
+             )
++        # Disk-backed engram tables (--engram-config '{"storage": "disk"}'):
++        # the row gather needs a host round trip, so it runs here, eagerly,
++        # before each forward instead of inside the (capturable) model code.
++        language_model = (
++            model.get_language_model()
++            if hasattr(model, "get_language_model")
++            else model
++        )
++        inner = getattr(language_model, "model", None)
++        self._disk_engram_model = (
++            inner if inner is not None and getattr(inner, "has_disk_engram", False) else None
++        )
+ 
+     def prepare_inputs(
+         self, input_batch: InputBatch, req_states: RequestState
+@@ -87,6 +99,13 @@ class DeepseekV41ModelState(DefaultModelState):
+             BLOCK_DEPTH=triton.next_power_of_2(depth),
+         )
+         model_inputs["lookback_token_ids"] = window
++        if self._disk_engram_model is not None:
++            self._disk_engram_model.stage_engram_rows(
++                input_batch.input_ids,
++                input_batch.positions,
++                input_batch.query_start_loc,
++                window,
++            )
+         return model_inputs
+ 
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 633d67bc61..84bb22f42d 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -115,6 +115,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+     TRITON_MLA_SPARSE_DSV4 = (
+         "vllm.models.deepseek_v4.ampere.ampere_sparse.DeepseekV4AmpereMLASparseBackend"
+     )
++    TRITON_MLA_SPARSE_DSV41 = (
++        "vllm.models.deepseek_v4_1.ampere.ampere_sparse."
++        "DeepseekV41AmpereMLASparseBackend"
++    )
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index d15ce1431f..708504050d 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1305,7 +1305,7 @@ def _get_cached_wo_a_bf16(
+         # ModelOpt MXFP8 stores the multiplicative E8M0 scale without the
+         # historical ``_inv`` suffix.
+         weight_scale = getattr(wo_a, "weight_scale", None)
+-    if weight_scale is not None:
++    if weight_scale is not None and wo_a.weight.element_size() == 1:
+         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+             torch.float32
+         )
+-- 
+2.53.0
+

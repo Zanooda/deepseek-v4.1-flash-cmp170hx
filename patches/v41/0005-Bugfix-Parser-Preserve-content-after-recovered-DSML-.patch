@@ -1,0 +1,130 @@
+From fab59e8603aa6ff52c1ee83121ac96b42de86527 Mon Sep 17 00:00:00 2001
+From: jinbagi <4094424+jinbagi@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 14:58:09 +0900
+Subject: [PATCH 05/13] [Bugfix][Parser] Preserve content after recovered DSML
+ invokes
+
+Assisted-by: OpenAI Codex
+Signed-off-by: jinbagi <4094424+jinbagi@users.noreply.github.com>
+(cherry picked from commit 1471b3f49f64b908aa1422ce3e8b44c4b5f027aa)
+---
+ tests/parser/engine/test_deepseek_v4.py       | 50 +++++++++++++++++++
+ vllm/parser/engine/streaming_parser_engine.py | 20 ++++++++
+ 2 files changed, 70 insertions(+)
+
+diff --git a/tests/parser/engine/test_deepseek_v4.py b/tests/parser/engine/test_deepseek_v4.py
+index e80d248551..6641081b2a 100644
+--- a/tests/parser/engine/test_deepseek_v4.py
++++ b/tests/parser/engine/test_deepseek_v4.py
+@@ -770,6 +770,56 @@ class TestMalformedWrapperRecovery:
+         assert result.tool_calls == []
+         assert result.content == text
+ 
++    def test_recovered_invoke_preserves_trailing_content_without_tool_end(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++
++        result = parser.extract_tool_calls(_recovery_invoke() + " Done.", mock_request)
++
++        assert result.tools_called is True
++        assert [call.function.name for call in result.tool_calls] == ["get_weather"]
++        assert result.content == " Done."
++
++    def test_recovered_parallel_invokes_validate_each_declared_tool(
++        self, mock_tokenizer, mock_request
++    ):
++        weather = _recovery_tool()
++        forecast = _make_tool("get_forecast", {"city": {"type": "string"}})
++        tools = [weather, forecast]
++        mock_request.tools = tools
++        parser = _content_recovery_parser(mock_tokenizer, *tools)
++        text = (
++            _recovery_invoke()
++            + _recovery_invoke(name="get_forecast")
++            + DSML_TOOL_END
++        )
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is True
++        assert [call.function.name for call in result.tool_calls] == [
++            "get_weather",
++            "get_forecast",
++        ]
++
++    def test_recovered_parallel_invoke_rejects_undeclared_second_tool(
++        self, mock_tokenizer, mock_request
++    ):
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(mock_tokenizer, tool)
++        rejected = _recovery_invoke(name="not_declared")
++        text = _recovery_invoke() + rejected + DSML_TOOL_END
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is True
++        assert [call.function.name for call in result.tool_calls] == ["get_weather"]
++        assert result.content == rejected
++
+     def test_streaming_orphan_invoke_recovers_after_split_marker(
+         self, mock_tokenizer, mock_request
+     ):
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index d536c017da..ade4081c3b 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -224,6 +224,7 @@ class StreamingParserEngine:
+         self._recovery_hold_name = ""
+         self._recovery_prior_state = self.state
+         self._recovery_prior_tool_index = -1
++        self._recovery_outer_closer_pending = False
+ 
+     def feed(
+         self,
+@@ -411,6 +412,14 @@ class StreamingParserEngine:
+     def _on_terminal(
+         self, terminal: str, value: str, token_count: int = 0
+     ) -> list[SemanticEvent]:
++        if (
++            self._recovery_outer_closer_pending
++            and self.state == ParserState.CONTENT
++            and terminal in self._tool_exit_terminals
++        ):
++            self._recovery_outer_closer_pending = False
++            return []
++
+         key = (self.state, terminal)
+         transition = self.config.transitions.get(key)
+ 
+@@ -560,6 +569,12 @@ class StreamingParserEngine:
+             if self.recovery_tool_name_validator is None:
+                 return self._emit_for_state(value, token_count)
+             return self._begin_recovery_hold(transition, value, token_count)
++        if (
++            self._recovery_outer_closer_pending
++            and self.state == ParserState.CONTENT
++            and transition.next_state in self._TOOL_STATES
++        ):
++            self._recovery_outer_closer_pending = False
+         return self._run_transition(transition, value, token_count)
+ 
+     def _begin_recovery_hold(
+@@ -605,6 +620,11 @@ class StreamingParserEngine:
+             self._recovery_hold_events.extend(transition_events)
+             events = self._recovery_hold_events
+             self._clear_recovery_hold()
++            # A recovered invoke started outside a valid outer tool wrapper.
++            # Do not leave it in TOOL_BETWEEN: subsequent text is content, and
++            # a following bare invoke must enter the provisional path again.
++            self.state = ParserState.CONTENT
++            self._recovery_outer_closer_pending = True
+             return events
+ 
+         return self._abort_recovery_hold()
+-- 
+2.53.0
+

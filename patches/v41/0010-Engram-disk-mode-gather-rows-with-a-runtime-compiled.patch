@@ -1,0 +1,171 @@
+From 356e734fe42330bb7299cbaca40cf479e86a8ecf Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <daniel.storozhev@gmail.com>
+Date: Fri, 11 Sep 2026 03:57:33 +0000
+Subject: [PATCH 10/13] Engram disk mode: gather rows with a runtime-compiled C
+ pthread pread helper (GIL released); the Python preadv loop capped at ~125k
+ syscalls/s and made a 4096-token chunk cost 1.6 s per Engram rank, capping
+ prefill at ~2.5k tok/s; 3.4x faster, byte-identical
+
+---
+ vllm/models/deepseek_v4_1/common/engram.py | 124 +++++++++++++++++++++
+ 1 file changed, 124 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 7d19895fe7..fdcc19fc11 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -35,6 +35,7 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
+ """
+ 
+ import concurrent.futures
++import functools
+ import json
+ import os
+ import re
+@@ -640,6 +641,109 @@ def _hf_engram_prefix(prefix: str) -> str:
+     return m.group(1)
+ 
+ 
++_ENGRAM_PREAD_C = r"""
++#include <pthread.h>
++#include <stdint.h>
++#include <unistd.h>
++
++typedef struct {
++    int fd_w, fd_s;
++    int64_t base_w, base_s;
++    const int64_t *rows;
++    int64_t lo, hi;
++    uint8_t *vals, *scales;
++    int dim, sdim;
++    int64_t short_reads;
++} job_t;
++
++static void *worker(void *arg) {
++    job_t *j = (job_t *)arg;
++    for (int64_t i = j->lo; i < j->hi; i++) {
++        int64_t r = j->rows[i];
++        ssize_t a = pread(j->fd_w, j->vals + i * j->dim, j->dim, j->base_w + r * j->dim);
++        ssize_t b = pread(j->fd_s, j->scales + i * j->sdim, j->sdim, j->base_s + r * j->sdim);
++        if (a != j->dim || b != j->sdim) j->short_reads++;
++    }
++    return NULL;
++}
++
++/* Gather rows[0..n) of a (values, scales) table with `threads` pthreads.
++   Returns the number of short/failed reads (0 = success). */
++int64_t engram_gather(int fd_w, int fd_s, int64_t base_w, int64_t base_s,
++                      const int64_t *rows, int64_t n, uint8_t *vals,
++                      uint8_t *scales, int dim, int sdim, int threads) {
++    if (n <= 0) return 0;
++    if (threads < 1) threads = 1;
++    if (threads > n) threads = (int)n;
++    pthread_t tid[256];
++    job_t jobs[256];
++    if (threads > 256) threads = 256;
++    int64_t per = (n + threads - 1) / threads;
++    int started = 0;
++    for (int t = 0; t < threads; t++) {
++        int64_t lo = t * per, hi = lo + per > n ? n : lo + per;
++        if (lo >= hi) break;
++        jobs[t] = (job_t){fd_w, fd_s, base_w, base_s, rows, lo, hi, vals, scales, dim, sdim, 0};
++        if (pthread_create(&tid[t], NULL, worker, &jobs[t]) != 0) {
++            worker(&jobs[t]);
++            continue;
++        }
++        started = t + 1;
++    }
++    int64_t bad = 0;
++    for (int t = 0; t < started; t++) {
++        pthread_join(tid[t], NULL);
++        bad += jobs[t].short_reads;
++    }
++    return bad;
++}
++"""
++
++
++@functools.cache
++def _engram_pread_lib():
++    """Compile (once per host, cached on disk) and load the C gather helper.
++
++    The Python ``preadv`` loop caps at ~125k syscalls/s regardless of thread
++    count (per-call interpreter overhead under the GIL), which made a
++    4096-token prefill chunk cost 1.6 s on the ranks owning an Engram layer
++    and capped prefill at ~2.5k tok/s. The C loop issues the same reads
++    from pthreads with the GIL released.
++    """
++    import ctypes
++    import hashlib
++    import subprocess
++    import tempfile
++
++    cache_dir = os.path.join(
++        os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")),
++        "engram_pread",
++    )
++    os.makedirs(cache_dir, exist_ok=True)
++    digest = hashlib.sha256(_ENGRAM_PREAD_C.encode()).hexdigest()[:16]
++    so_path = os.path.join(cache_dir, f"engram_pread_{digest}.so")
++    if not os.path.exists(so_path):
++        with tempfile.TemporaryDirectory() as tmp:
++            src = os.path.join(tmp, "engram_pread.c")
++            with open(src, "w") as f:
++                f.write(_ENGRAM_PREAD_C)
++            out = os.path.join(tmp, "engram_pread.so")
++            subprocess.run(
++                ["gcc", "-O2", "-shared", "-fPIC", "-pthread", src, "-o", out],
++                check=True,
++                capture_output=True,
++            )
++            os.replace(out, so_path)
++    lib = ctypes.CDLL(so_path)
++    lib.engram_gather.restype = ctypes.c_int64
++    lib.engram_gather.argtypes = [
++        ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
++        ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
++        ctypes.c_int, ctypes.c_int, ctypes.c_int,
++    ]
++    return lib
++
++
+ class _DiskEngramTable:
+     """Rows of one engram table gathered straight from the safetensors shard.
+ 
+@@ -714,6 +818,14 @@ class _DiskEngramTable:
+         self._np_vals = self.host_vals.numpy()
+         self._np_scales = self.host_scales.numpy()
+         self._pool = concurrent.futures.ThreadPoolExecutor(self.num_threads)
++        try:
++            self._lib = _engram_pread_lib()
++        except Exception as e:  # noqa: BLE001
++            logger.warning(
++                "engram disk gather: C helper unavailable (%s); using the slower "
++                "Python thread pool", e
++            )
++            self._lib = None
+         logger.info(
+             "Engram table %s served from disk (%s, %.1f GiB never loaded); "
+             "%d reader threads, staging %d rows",
+@@ -772,6 +884,18 @@ class _DiskEngramTable:
+         if n == 0:
+             return
+         wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
++        lib = self._lib
++        if lib is not None:
++            rows64 = np.ascontiguousarray(rows, dtype=np.int64)
++            bad = lib.engram_gather(
++                wfd, sfd, self.weight_base, self.scale_base,
++                rows64.ctypes.data, n,
++                self._np_vals.ctypes.data, self._np_scales.ctypes.data,
++                self.dim, self.scale_dim, self.num_threads,
++            )
++            if bad:
++                raise RuntimeError(f"engram disk gather: {bad} short reads")
++            return
+         vals, scales = self._np_vals, self._np_scales
+         dim, sdim = self.dim, self.scale_dim
+         wbase, sbase = self.weight_base, self.scale_base
+-- 
+2.53.0
+

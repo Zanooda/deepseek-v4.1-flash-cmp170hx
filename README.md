@@ -1,241 +1,269 @@
-# DeepSeek-V4-Flash on 4× CMP 170HX
+# DeepSeek-V4 and V4.1 Flash on CMP 170HX mining cards
 
-Running **DeepSeek-V4-Flash-0731** (~284B total / ~13B active) on four **NVIDIA CMP 170HX**
-mining cards — GA100 silicon, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x4, no P2P.
+vLLM patches, container builds, launch scripts and benchmark harnesses for
+**DeepSeek-V4.1-Flash** on eight and **DeepSeek-V4-Flash-0731** on four 64 GB
+**CMP 170HX** (sm_80, PCIe Gen2 x4). Every number below was measured on that hardware.
 
-**98 tok/s decode · ~5,300 tok/s prefill · 1,047,736 verified context — the model's full 1M.**
+| | DeepSeek-V4.1-Flash, 8 cards | DeepSeek-V4-Flash-0731, 4 cards |
+|---|---|---|
+| decode, one stream | **117 tok/s** at 128k, 96 at 512k (text-dependent, see below) | **98 tok/s** |
+| decode, 8 streams together | **532 tok/s** aggregate at 128k (66 per stream) | 713 tok/s at 64 streams |
+| prefill, one stream | **6,066 tok/s** at 105k tokens (time to first token 17 s) | ~5,300 tok/s |
+| longest verified prompt | 1,007,820 tokens (the model's full 1M) | 1,047,736 tokens |
+| KV pool | 6.17M tokens, 5.9 concurrent 1M requests | |
+| speculative decoding | DSpark, up to 6 tokens per step | DSpark, 1.93× |
 
-> ⚠️ **If you run long *conversations*, set `DSV4_LOGITS_ROW_CHUNK=64`, not 128.** The 1M figure
-> above is a **single one-shot prefill**. A real accumulating chat on the same config dies at
-> **~718–733k** with a CUDA illegal memory access (reproduced twice). At `64` a 405-turn
-> conversation reached **1,002,852 tokens** clean. See
-> [accumulated vs one-shot](RESULTS.md#accumulated-conversation--one-shot-prefill).
-> Note also that **retrieval accuracy degrades well before any crash** — ~100% at 150k, **~30% at
-> 900k**. The window loads and runs; it is not uniformly usable.
-
-For scale: a single DGX Spark does ~14 tok/s on this class of model, and a dual-Spark setup
-with speculative decoding reports 55–67.
-
-The 170HX is an ex-mining card with no display output and a fused-down PCIe link, but it is
-GA100 silicon with 64 GB of HBM2e at ~1.6 TB/s once unlocked. Pricing has moved a lot as
-people found LLM uses for them — around **$1,100–1,200 per card** as of August 2026, so
-budget for four accordingly.
-
-This repo contains the patches, container build, launch scripts and benchmark harnesses —
-plus [every setting and why it has that value](SETTINGS.md), and the
-[full measured results](RESULTS.md) including the things that *don't* work.
-
----
-
-## What is actually new here
-
-**DSpark speculative decoding running under pipeline parallelism.** vLLM refuses this
-combination in three separate places. Enabling it is worth **1.93×** and — unlike on tensor
-parallel, where speculation goes *negative* above ~8 concurrent requests — it keeps winning
-all the way to 64 concurrent on PP.
-
-Everything else in this repo is packaging: a working container build, the launch settings,
-and honest benchmarks.
-
-Credit where it's due: the SM8x DeepSeek-V4 backend is
+This repository is based on the work in
+[allover326/deepseek-v4-cmp170hx](https://github.com/allover326/deepseek-v4-cmp170hx),
+which produced the DeepSeek-V4 stack, the V4 patch series and the V4 measurements below;
+the DeepSeek-V4.1 series and its results were added on top. Both stacks build on
 [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100),
-built on work discussed in [vllm#50576](https://github.com/vllm-project/vllm/issues/50576).
-This repo sits on top of that branch.
-
-> **2026-08-13 — recommended base moved from `f8ea5bb` to `c3046d1`** (+7% decode measured,
-> p<0.001; patch 0001 is now upstream; the range touches `csrc/` so it needs a
-> [full source build](docker/Dockerfile.fullbuild), and the base commit is only recoverable by
-> [tarball](patches/README.md#getting-c3046d1--it-is-unreachable-by-any-git-method) after
-> upstream's second force-push). Details and the honest numbers — including why a circulated
-> "+30%" claim does not reproduce — in [RESULTS](RESULTS.md#rebase-to-c3046d1-2026-08-13).
+the sm_80 DeepSeek-V4 backend (see [vllm#50576](https://github.com/vllm-project/vllm/issues/50576)).
+Deep dives: [SETTINGS.md](SETTINGS.md) (every flag and why), [RESULTS.md](RESULTS.md)
+(all measurements, including what does not work), [patches/README.md](patches/README.md)
+(patch-by-patch notes and the base-commit recovery procedures).
 
 ---
 
-## Requirements
+## DeepSeek-V4.1-Flash on 8 cards
 
-- **3 or 4 CMP 170HX** (or other 64 GB sm_80 cards). Most numbers on this page were taken on 4.
-  **3 cards also works** — you must set `VLLM_PP_LAYER_PARTITION=15,15,13`, because the last
-  pipeline rank also carries `lm_head` and the DSpark drafter. ⚠️ An earlier version of this
-  page said 3 cards could not work; that was **wrong** and is retracted in
-  [RESULTS](RESULTS.md#three-or-four-cards). 2 cards cannot hold ~155 GiB of weights.
-- Cards must be **VRAM-unlocked** — `nvidia-smi` should report 65,536 MiB, not 8,192 MiB.
-- Check the power-brake diagnostic below before benchmarking anything. It is
-  motherboard-specific and most people will not hit it, but it costs ~4× if you do.
-- The original `deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint (**~155.4 GiB / 166.9 GB** on disk; `du` under-reports it as ~140 GB). The
-  INT4/compressed-tensors repack is **not** needed; this branch reads the native
-  MXFP4+FP8 weights.
-- Docker with the NVIDIA runtime.
+vLLM support for V4.1 is [PR #56201](https://github.com/vllm-project/vllm/pull/56201);
+this repo ports the PR onto the sm_80 fork. On sm_80 the FP4 experts and FP8 dense layers
+run as Marlin W4A16/W8A16, attention and indexer scoring are Triton, fp8 conversions are
+software. Weights take ≈ 41 GB per card at PP=8 (46 GB on the last rank, which also holds
+`lm_head` and the drafter). The two 98 GB Engram tables live in pinned host RAM (203 GB)
+or, on smaller hosts, are gathered per step from the NVMe shards.
 
-## Quick start
+### Quick start (V4.1)
 
 ```bash
-# Easiest: pull the prebuilt c3046d1 image (patches 0002-0008 baked in)
-docker pull zanooda/vllm-sm80:c3046d1
+# 1. the patched vLLM tree: PR #56201 head + all 13 patches
+git clone https://github.com/vllm-project/vllm.git ~/vllm-v41 && cd ~/vllm-v41
+git fetch origin pull/56201/head && git checkout -b v41-sm80 79a7108d9a
+git am ~/deepseek-v4-cmp170hx/patches/v41/*.patch
+
+# 2. the image: sm_80-only SASS, built from the PR head + patches 0001-0008
+docker pull zanooda/vllm-sm80-ds41f:v41-sm80
+
+# 3. checkpoint deepseek-ai/DeepSeek-V4.1-Flash (510 GB, 48 shards) under /models, then
+DSV41_VLLM_SRC=$HOME/vllm-v41/vllm ~/deepseek-v4-cmp170hx/launch/run-v41-pp8.sh
+```
+
+**The bind mounts are not optional.** The published image contains patches 0001–0008 only,
+which is the part that needs a CUDA build. Patches 0009–0013 are Python-only and the launch
+script mounts them over the image from the checkout you point `DSV41_VLLM_SRC` at: every
+`vllm/*.py` file that differs from the image's commit. Without them the engine does not
+start (0009 is what makes a PP=8 split of V4.1's shared caches possible at all), and
+without 0010–0013 you get 3.4× slower prefill, full-context indexer scoring, no host-RAM
+Engram and an incomplete tool-call parser. The step-1 checkout is therefore part of the
+runtime, not a build convenience. To do without it, rebuild the image from the full series
+with `docker/vastai-build-push-v41.sh` (any box with ≥ 48 GB RAM and a CUDA 13 toolkit; it
+clones vLLM, checks out the PR head, applies `patches/v41/`, verifies both tree SHAs and
+builds `Dockerfile.fullbuild` for sm_80) and set `DSV41_IMG_COMMIT` to that image's commit
+so the mount list becomes empty.
+
+Defaults in the launch script (all measured, see [SETTINGS.md](SETTINGS.md#deepseek-v41-flash-launchrun-v41-pp8sh)):
+PP=8 with `VLLM_PP_LAYER_PARTITION=5,5,5,5,5,5,5,5`, `--max-model-len 1048576`,
+`--gpu-memory-utilization 0.95`, `--block-size 128`, `--max-num-batched-tokens 4096`,
+`--max-num-seqs 8`, fp8 KV, `--engram-config '{"storage":"cpu"}'`, DSpark with 5 draft
+tokens, `VLLM_USE_BREAKABLE_CUDAGRAPH=1`, `deepseek_v41` tool and reasoning parsers,
+`--enable-prompt-tokens-details`, up to 8 images per request. Startup takes about 10 minutes
+(204 s of weight loading per rank, ~95 s to read the Engram tables into RAM, then profiling
+and graph capture).
+
+
+### The V4.1 patch series
+
+Thirteen patches on top of the PR head, in `patches/v41/`. Details and rationale per patch
+in [patches/README.md](patches/README.md#-2026-09-10-deepseek-v41-flash-series--patchesv41-runs-on-8-cmp-170hx-pp8).
+
+| # | what it does |
+|---|---|
+| 0001 | **The fork's sm_80 layer, rebased onto the PR head.** 72 files: the Ampere DeepSeek-V4 attention on the Triton kernels, `fp8_sm80.py` (software fp8), `mqa_logits_triton.py` (indexer scoring), Marlin/MoE/mHC/DSpark work, `topk.cu`. 49 files applied clean, 22 were hand-merged. |
+| 0002 | **Our V4 patches, hand-ported:** DSpark under pipeline parallelism (draft `pipeline_parallel_size=1`, `broadcast_draft()`, draft-token scatter on non-last ranks, drafter embedding from the checkpoint), the prefill top-k torch fallback and `DSV4_LOGITS_ROW_CHUNK`, both extended to V4.1's candidate-block select/mask. |
+| 0003–0006 | **DSML tool-call recovery**, vLLM PR #52645 commits 1–4: recover tool calls whose outer `<｜DSML｜ calls>` wrapper is missing or corrupted, hold them provisional until the invoke closes and the function name matches a declared tool. |
+| 0007 | Merge fix-ups found by a static undefined-name pass over the hand-merge (ROCm ragged graph-buffer builder, three tilelang kernels, a test import). |
+| 0008 | **What makes V4.1 run on sm_80.** An Ampere attention class over the PR's ROCm Triton sparse-MLA implementation (backend `TRITON_MLA_SPARSE_DSV41`); software fp8 in every new V4.1 kernel; dense MXFP8 linears through Marlin W8A16 (with a bf16 dequant exception for `wo_a`, which an einsum reads raw); and `EngramConfig.storage = cpu \| gpu \| disk`, where `disk` gathers only the rows a step needs from the safetensors shards. |
+| 0009 | **What the first engine start needed** (eight launch iterations). `pp_share.py`: cross-rank replication of the KV-source and indexer caches, because V4.1 shares caches across layers that any PP partition splits across ranks, and upstream cannot do that at all. Also: input ids on every rank, Engram loader skips and a no-mmap safetensors reader, KV-layout intersection and per-worker KV tensor packing, a tile-scheduler stub for the FlashMLA-less SWA path, block size 128, breakable CUDA graphs on. |
+| 0010 | **Engram disk gather in C.** The per-step row gather moved from a Python `preadv` thread pool (125k syscalls/s, the prefill ceiling) to a runtime-compiled pthread helper: prefill 3.4× faster. |
+| 0011 | **Candidate-only indexer scoring.** Layers 24/28/32/36 score only the 2,048 candidate blocks layer 20 published instead of the whole context and then masking: bit-identical scores, identical top-k, 8× less indexer work at 128k, 64× at 1M, and a 10 % larger KV pool as a side effect (the full-width transient disappears from memory profiling). Kill switch `VLLM_DSV41_CAND_LOGITS=0`. |
+| 0012 | Parser accepts the near-miss wrapper spellings `<｜DSML｜calls>` and `<｜DSML｜_calls>` the model writes near the context limit. |
+| 0013 | **Engram tables in pinned host RAM without the load transient.** Torch's pinned allocator rounds a 98 GB table to a 128 GiB block and the generic loader materialises a second copy before `copy_()`, so `storage=cpu` needed ~330 GB and was OOM-killed three times. Exact-size `cudaHostRegister` plus a direct chunked fill from the shard bring it to 203 GB. Prefill +25–38 %, decode +10 % over the NVMe gather. |
+
+### V4.1 benchmarks
+
+All numbers: 8× CMP 170HX, PP=8 as launched above, word-salad prompts of unique content,
+greedy decoding, prefix cache cold unless noted. Raw data in `bench/*.jsonl`; tables and
+caveats in [RESULTS.md](RESULTS.md#deepseek-v41-flash-on-8-cmp-170hx).
+
+**Prefill, one stream** (time to first token, prompt tokens / TTFT):
+
+| prompt tokens | Engram from NVMe (patch 0010) | Engram in RAM (patch 0013) |
+|---|---|---|
+| 26,208 | 8.1 s · 3,255 tok/s | **5.8 s · 4,486 tok/s** |
+| 104,881 | 21.3–23.5 s · 4,455–4,930 tok/s | **17.3 s · 6,066 tok/s** |
+| 419,430 | 88–106 s · 3,965–4,780 tok/s | **78.7 s · 5,328 tok/s** |
+| 1,007,820 | 468 s · 2,151 tok/s (measured before 0010/0011/0013; not re-run) | |
+
+**Decode, one stream**: 117 tok/s at 128k, 96 tok/s at 512k (Engram in RAM). The step rate
+is a constant ~16 steps/s; tokens per step depend on DSpark acceptance, which depends on
+the text: ~5.9 tokens per step on repetitive output (98–117 tok/s), ~3.9 on prose
+(61 tok/s). Read any decode figure against the prompt that produced it.
+
+**Decode, several streams together** (only the window in which every stream is generating
+and no prefill is in flight; `bench/bench_v41_decode_window.py`):
+
+| prompt tokens | streams | aggregate | per stream |
+|---|---|---|---|
+| 26k | 8 | 452 tok/s | 56.5 |
+| 105k | 8 | **532 tok/s** | 66 |
+| 420k | 4 | 411 tok/s | 103 |
+
+Decode throughput is essentially flat in context length. It does depend on request arrival:
+with pipeline parallelism vLLM packs all runnable requests into one micro-batch, so eight
+requests that become ready in the same step walk the eight stages as a single batch
+(274 tok/s) while requests that join one at a time overlap (532). Batches merge and never
+split; a scheduler patch to spread requests over the in-flight micro-batches is the open
+item. The older `bench_v41_matrix.py` "c=4 / c=8 decode collapse" numbers in RESULTS.md were
+this effect plus prefill interference, not decode scaling.
+
+**Memory**: KV pool 6,171,394 tokens at utilisation 0.95 (5.9 concurrent 1M-token
+requests). The pool is set by the last rank, which has 46 GB of weights; V4.1's own KV is
+tiny (~2.3 kB per token over the whole model). `5,5,5,5,5,5,6,4` gives 6.86M tokens but
+costs concurrent decode; a last rank with fewer than 4 layers cannot start (the drafter's
+auxiliary states come from layers 36–38).
+
+**Correctness**: chat coherence 5/5 (factual, arithmetic, code, multi-turn memory, tool
+call); needles 19/19 at 4k, 32k, 128k, 512k and 1M (820k real tokens), depths 10/50/90 %,
+plus 4 concurrent needles with distinct passphrases and no cross-request bleed; automatic
+tool choice with the `deepseek_v41` parser; images (the checkpoint's vision encoder) verified
+with multi-image prompts; `prompt_tokens_details.cached_tokens` reported for prefix-cache
+hits.
+
+### Operational findings
+
+- **Power.** One card fell off the PCIe bus (Xid 79) three times under sustained load at the
+  stock 250 W limit and is stable at 180 W (`nvidia-smi -pl 180`, persisted by a systemd unit).
+  Memory tested clean; it is power delivery on that card. Put a capped card on the last pipeline rank,
+  which draws the least (`DSV41_GPUS` sets the device order).
+- **P2P (cmpunlocker BAR1 patches).** Works across all pairs at 1.55 GB/s and NCCL uses it
+  for every pipeline hop (`NCCL_P2P_LEVEL=SYS`), but the hops are bound by the Gen2 x4 link
+  either way: no measurable speed change. Tensor parallel stays 6.6× slower on prefill.
+- **Engram placement.** `cpu` (pinned RAM, needs ~240 GB total) is the default; `disk` with
+  `launch/warm-engram-cache.sh` (both shards in the evictable page cache) reaches ~80 % of the
+  gain on 210–240 GB hosts; plain `disk` runs on 32 GB with NVMe latency per step.
+- **Reasoning effort** is a numeric budget 1–100 in the prompt. `low`/`high`/`xhigh`/`max`
+  map to 25/50/75/100 on this server, `none` disables thinking; `minimal` and `medium` are
+  rejected.
+
+---
+
+## DeepSeek-V4-Flash-0731 on 4 cards
+
+PP=4 with DSpark speculative decoding, verified to the model's full 1,047,736-token context.
+
+### Quick start (V4)
+
+```bash
+docker pull zanooda/vllm-sm80:c3046d1          # patches 0002-0008 baked in
 docker tag zanooda/vllm-sm80:c3046d1 dsv4-a100:devel
-
-deepseek-v4-cmp170hx/launch/run-pp-dspark.sh   # sources default to ~/vllm/vllm
+launch/run-pp-dspark.sh                         # sources default to ~/vllm/vllm
 ```
 
-Building it yourself instead — note the base is `c3046d1`, which touches `csrc/`, so this is a
-**full CUDA source build (~2-4 h, needs >= 48 GB RAM)**; the old 10-minute `Dockerfile.devel`
-flow cannot deliver the kernel changes. There is also a self-contained remote-build script
-([docker/vastai-build-push.sh](docker/vastai-build-push.sh)) that does all of the below and
-pushes to a registry:
+Building yourself means a full CUDA source build (2–4 h, ≥ 48 GB RAM) of the fork at
+`c3046d1` plus `patches/0002`–`0009`; `c3046d1` was force-pushed away and is only recoverable
+by tarball, procedure in [patches/README.md](patches/README.md#getting-c3046d1--it-is-unreachable-by-any-git-method).
+`docker/vastai-build-push.sh` does the whole thing on a rented box. Three cards also work
+with `VLLM_PP_LAYER_PARTITION=15,15,13`; two cannot hold the weights.
 
-```bash
-git clone https://github.com/haosdent/vllm.git && cd vllm
+### The V4 patch series
 
-# c3046d1 is NOT reachable by any git method (force-pushed, referenced by nothing).
-# Reconstruct it from the tarball and verify the tree SHA -- full procedure and
-# the safety story in patches/README.md:
-curl -sL -o /tmp/c3046d1.tar.gz \
-  https://codeload.github.com/haosdent/vllm/tar.gz/c3046d1ebd2dae9b94ad2ef5f966ea153632251e
-# ... reconstruct + verify per patches/README.md, then:
-git checkout -B rebase-c3046d1 c3046d1-recon
+| # | file | what it does |
+|---|---|---|
+| 0001 | `sparse_attn_indexer.py` | `has_device_capability(90)` gate on the persistent top-k (legacy `f8ea5bb` base only; upstream in `c3046d1`) |
+| 0002 | `config/speculative.py` | the DSpark draft runs whole on the last rank: `draft_parallel_config.pipeline_parallel_size = 1` |
+| 0003 | `v1/worker/gpu/pp_utils.py` | `broadcast_draft()` and its receive: relay draft tokens to the ranks that must verify them (vLLM PR #46994) |
+| 0004 | `v1/worker/gpu/model_runner.py` | drop the "no DSpark under PP" guard, call `broadcast_draft()`, scatter relayed tokens |
+| 0005 | `spec_decode/dspark/utils.py` | drop the `NotImplementedError`, load the draft's token embedding from the checkpoint (under PP the target's embedding lives on rank 0) |
+| 0005a | `sparse_attn_indexer.py` | torch fallback for the prefill top-k on sm_8x: the CUDA kernel leaves indices uninitialised above ~128k and crashes with an illegal memory access |
+| 0006 | `sparse_attn_indexer.py` | `DSV4_LOGITS_ROW_CHUNK`: row-chunk the indexer's `[M, N]` fp32 logits transient. **The context-ceiling fix: ~134k → 1,047,736 tokens.** |
+| 0007 | `parser/deepseek_v4.py` + engine | DSML tool-call recovery for missing/corrupted wrappers (vLLM PR #52645, commits 1–4) |
+| 0008 | `rejection_sampler_utils.py` | NaN block maxima → `-inf` before `argmax` (vLLM PR #50183) |
+| 0009 | `models/deepseek_v4/**`, `csrc` | CUDA-graph/indexer corruption fixes (vLLM PRs #52492, #52836): the intermittent token-salad windows across all sessions |
 
-# patches 0002 -> 0008 (0001 is dropped -- its gate is upstream in c3046d1)
-for p in ../deepseek-v4-cmp170hx/patches/000{2,3,4,5,5a,6,7,8}*.patch; do patch -p1 < "$p"; done
+Together, 0002–0005 are what enables **DSpark under pipeline parallelism**, which vLLM
+refuses in three places. It is worth 1.93× on decode and, unlike on tensor parallel where
+speculation turns negative above ~8 streams, keeps winning to 64 concurrent streams.
 
-docker build -f ../deepseek-v4-cmp170hx/docker/Dockerfile.fullbuild -t dsv4-a100:devel .
-
-../deepseek-v4-cmp170hx/launch/run-pp-dspark.sh
-```
-
-Two build traps worth knowing before you start:
-
-- **Build from inside the vLLM checkout.** If your model weights live in a parent directory,
-  a build rooted there will try to ship hundreds of GB to the Docker daemon as build context.
-- **The base image needs a real CUDA toolkit.** `python:3.12-slim` plus pip CUDA wheels gives
-  `nvcc` 13.3 against FlashInfer's bundled headers for 13.0, and FlashInfer's JIT is a hard
-  requirement at engine init. Both Dockerfiles use `nvidia/cuda:13.0.2-cudnn-devel` with a
-  venv, which is why they work.
-- **RAM.** The full build OOMs on 30 GB even at `MAX_JOBS=16`; it is capped at 8 for a
-  reason. Give it >= 48 GB or add swap before raising it.
-
-On the *old* `f8ea5bb` base the SM8x work was Python/Triton-only, so `Dockerfile.devel`
-(`VLLM_USE_PRECOMPILED=1`) turned the build into a ~10-minute download. That no longer
-holds on `c3046d1`: the base itself changes `csrc/`, and precompiled wheels physically
-cannot contain those kernels.
-
----
-
-## Results at a glance
+### V4 benchmarks
 
 | | plain | **+ DSpark** |
 |---|---|---|
 | decode, single stream | 50.8 | **98.1 tok/s** |
-| decode @ 64 concurrent | 472.0 | **712.8 tok/s** |
-| decode @ 100k context | 38.8 | **90.0 tok/s** |
+| decode, 64 concurrent | 472.0 | **712.8 tok/s** |
+| decode at 100k context | 38.8 | **90.0 tok/s** |
 | prefill (25k–77k context) | ~5,300 | ~5,200 tok/s |
-| time to first token @ 100k | 14.6 s | 14.6 s |
+| time to first token at 100k | 14.6 s | 14.6 s |
+| time to first token at 1M | | 9.2 min (decode 35.6 tok/s) |
 
-**Use pipeline parallel, not tensor parallel.** On this hardware PP beats TP by **6.6× on
-prefill** — TP measures flat at ~800 tok/s from 1.5k to 77k tokens, because it performs 86
-all-reduces per forward pass on a PCIe Gen2 x4 link with no P2P. PP moves the same data 3
-times. Full reasoning in [SETTINGS.md](SETTINGS.md#--pipeline-parallel-size-4--not-tensor-parallel).
+Pipeline parallel beats tensor parallel by 6.6× on prefill here: TP performs 86 all-reduces
+per forward over a Gen2 x4 link with no P2P and measures flat at ~800 tok/s. Full tables:
+[RESULTS.md](RESULTS.md).
 
-Full tables, correctness testing and limits: **[RESULTS.md](RESULTS.md)**.
+### V4 known limits
+
+- **Conversations have a lower ceiling than one-shot prompts.** At `DSV4_LOGITS_ROW_CHUNK=128`
+  a one-shot prefill reaches 1,047,736 tokens but a multi-turn chat dies at ~718–733k; at `64`
+  a 405-turn chat reached 1,002,852 clean. Use 64 for conversational workloads.
+- **Retrieval accuracy degrades with depth**: 100 % at 150k, 87 % at 300k, 60 % at 450k,
+  50 % at 750k, 30 % at 900k. `index_topk` is a fixed 512 while the candidate pool grows;
+  treat 1M as a large working set, not a database. Thinking recovers part of it
+  (61 → 81 % at depth), the effort level does not.
+- **DSpark output is not reproducible at temperature 0**, a property of DSpark itself.
+- **Never use `--enforce-eager`**: 8–10 tok/s.
 
 ---
 
-## Troubleshooting: cards running ~4× slow (`PWRBRK#` / edge pin B30)
+## Troubleshooting: cards running 4× slow (PWRBRK#)
 
-**Check this first if your throughput is nowhere near the numbers here.** It is not a
-property of the CMP 170HX — it is a motherboard behaviour, and most boards do not do it.
-
-`PWRBRK#` is an optional PCIe sideband signal on **edge pin B30** that lets a platform force
-GPUs into an emergency low-power state. Some workstation boards assert it. On an
-**ASUS Pro WS WRX80E-SAGE** (the board these results were produced on) it is asserted on the
-x16 slots, which pins the card in a permanent hardware power brake:
-
-| | braked | healthy |
-|---|---|---|
-| power draw | ~88 W of a 250 W budget | 105–180 W |
-| clocks | 1140 MHz | ~1400 MHz |
-| fp16 | 39.3 TFLOPS | **155.7 TFLOPS** |
-| memory bandwidth | ~608 GB/s | ~1355 GB/s |
-
-### Diagnosing it
+Some boards (the ASUS Pro WS WRX80E-SAGE used for the V4 numbers) assert `PWRBRK#` on edge
+pin **B30** and pin the card at ~88 W, 1140 MHz, a quarter of its fp16 and half its bandwidth.
 
 ```bash
-nvidia-smi -q | grep -A1 "HW Power Brake Slowdown"
+nvidia-smi -q | grep -A1 "HW Power Brake Slowdown"      # "Active" on an idle card = braked
 ```
 
-`Active` on a card that is not thermally or power limited means the platform is asserting
-`PWRBRK#`. To count healthy cards across a 4-GPU box:
+Fix: Kapton tape over pin B30 (B side, counted from the notch), a riser that does not route
+B30, or a BIOS/BMC option if the board has one. Do nothing if it reads "Not Active".
 
-```bash
-nvidia-smi -q | grep -c "HW Power Brake Slowdown  *: Not Active"   # want 4
-```
-
-This is worth ruling out early because it looks exactly like "these mining cards are just
-slow" — the cards are fine, and it cost a great deal of time here before being identified.
-A PCIe riser was what proved it: the same card in the same slot ran at full speed through a
-riser that does not carry B30.
-
-### Fixing it
-
-- **Kapton tape over pin B30** on the card's edge connector (B30 is on the B-side, counted
-  from the notch end). This is the usual fix.
-- **A riser that does not route B30**, which also works and requires no modification.
-- **A BIOS/BMC option**, if your board exposes one — many do not.
-
-If your board does not assert `PWRBRK#`, do nothing. Taping a pin that was never being
-driven gains you nothing and risks damaging the contact.
-
-## Known limits
-
-- ~~**Context ceiling ~150k, and it scales INVERSELY with `--max-model-len`.**~~ **FIXED —
-  see [patch 0006](patches/README.md).** The ceiling was the sparse indexer's `[M, N]` float32
-  logits transient; row-chunking it (`DSV4_LOGITS_ROW_CHUNK`) lifts the verified context from
-  ~150k to **1,047,736 tokens**, the model's full 1M. The inverse-scaling advice that used to
-  be here was a symptom of that bug and **no longer applies** — set `--max-model-len` to what
-  you need. Costs nothing measurable; see [RESULTS](RESULTS.md#-context-ceiling--solved).
-- ★ **An accumulating conversation has a LOWER ceiling than a one-shot prefill, and
-  `DSV4_LOGITS_ROW_CHUNK` moves it.** At `128` a one-shot prefill reaches 1,047,736 but a real
-  multi-turn chat dies at **~718–733k** (CUDA illegal memory access in
-  `_top_k_per_row_prefill_torch`, always on the same PP rank, reproduced twice). At `64` a
-  405-turn chat reached **1,002,852** clean. **Use 64 for conversational workloads.** A one-shot
-  prefill at the same depth is unaffected — this is specific to the prefix-cached path, which
-  needle tests never exercise. See
-  [accumulated vs one-shot](RESULTS.md#accumulated-conversation--one-shot-prefill).
-- ★ **Retrieval accuracy degrades with depth, long before any crash.** Facts planted at known
-  positions and re-queried: **100% at 150k, 87% at 300k, 60% at 450k, 50% at 750k, 30% at 900k.**
-  This is *not* a bug in these patches — chunk size does not change it (identical at matched
-  depth) and no prompt fixes it. `index_topk` is a fixed 512 while the candidate pool grows
-  linearly with context, so the fraction of context reachable falls ~6× from 150k to 900k.
-  **Treat 1M as a large working set, not a reliable database.** Keep retrieval-critical context
-  under ~150k, or re-inject facts that must survive.
-- **Long context is slow, not free.** TTFT at 1M is **9.2 minutes** and decode drops to
-  **35.6 tok/s**. Prefill is the expensive half — at the top of its range this is a
-  batch/document tool, not an interactive one. Both curves are in
-  [RESULTS](RESULTS.md#speed-vs-context).
-- **DSpark output is not reproducible** at temperature 0, including run-to-run on the same
-  server. Verified to be a property of DSpark itself, not of these patches (the stock
-  upstream tensor-parallel path behaves the same way). Quality is unaffected in every test
-  here. Run without `--speculative-config` if you need determinism.
-- **Never use `--enforce-eager`** — 8–10 tok/s, worse than no speculation at all.
+---
 
 ## Repo layout
 
 ```
-patches/     8 patches (0002-0008 on c3046d1; 0001 only on the legacy f8ea5bb base) — see patches/README.md
-docker/      Dockerfile.fullbuild (source build, c3046d1), Dockerfile.devel (precompiled, f8ea5bb-era),
-             vastai-build-push.sh (remote build + registry push)
-launch/      run-pp-dspark.sh (best config) and run-a100.sh (tensor-parallel variant)
-bench/       the 8 harnesses every number in RESULTS.md came from
-SETTINGS.md  every flag and why it has that value
-RESULTS.md   measured results, correctness testing, limits, measurement pitfalls
+patches/            V4 series 0001-0009 (on haosdent/vllm c3046d1) and patches/README.md
+patches/v41/        V4.1 series 0001-0013 (on vLLM PR #56201 head 79a7108d9a)
+docker/             Dockerfile.fullbuild, Dockerfile.devel, vastai-build-push.sh (V4),
+                    vastai-build-push-v41.sh (V4.1, verifies both tree SHAs)
+launch/             run-pp-dspark.sh (V4), run-a100.sh (V4 TP variant),
+                    run-v41-pp8.sh (V4.1 PP=8), warm-engram-cache.sh (page-cache Engram)
+bench/              every harness behind RESULTS.md: bench_v41_check.py (coherence + needles),
+                    bench_v41_matrix.py (context x concurrency), bench_v41_decode_window.py
+                    (prefill-free concurrent decode), v41_partition_trial.sh, the V4 harnesses,
+                    and the raw *.jsonl
+SETTINGS.md         every flag and environment variable, and why it has that value
+RESULTS.md          all measurements, correctness tests, limits and measurement pitfalls
 ```
 
-## Contributing back
+## Clients
 
-Patches 2–5 are small and general. Pipeline parallel was flagged as *the* uncovered
-configuration in [vllm#50576](https://github.com/vllm-project/vllm/issues/50576), and patch 3
-is essentially vLLM PR #46994, which upstream still needs. If you have hardware to test on —
-especially a non-170HX sm_80 box such as an A100 or A800 — results either way are useful.
+The engine speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`) with tool
+calling, reasoning content, images and prefix-cache usage details. A litellm proxy in front
+of it works unchanged; allow `reasoning_effort` through (`allowed_openai_params`) so clients
+can set the thinking budget per request.
 
 ## License
 
-Apache-2.0, matching vLLM. The patches are derivative of vLLM and of
-haosdent/vllm@dsv4-flash-a100.
+Apache-2.0, matching vLLM. The patches are derivative of vLLM, of
+haosdent/vllm@dsv4-flash-a100, and of
+[allover326/deepseek-v4-cmp170hx](https://github.com/allover326/deepseek-v4-cmp170hx).

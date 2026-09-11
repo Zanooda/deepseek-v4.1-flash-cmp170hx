@@ -1,0 +1,97 @@
+From 8742531a05df958e7443891a3d6c9f23b175c538 Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <daniel.storozhev@gmail.com>
+Date: Thu, 10 Sep 2026 07:30:58 +0000
+Subject: [PATCH 07/13] merge fixups: ROCm ragged graph-buffer builder,
+ tilelang_jit decorators for fork kernels, test import
+
+---
+ .../kernels/mhc/tilelang_kernels.py           | 12 +++--------
+ vllm/models/deepseek_v4/amd/rocm.py           | 21 ++++++++-----------
+ 2 files changed, 12 insertions(+), 21 deletions(-)
+
+diff --git a/vllm/model_executor/kernels/mhc/tilelang_kernels.py b/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+index e84e677564..f817b9be8a 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang_kernels.py
++++ b/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+@@ -998,9 +998,7 @@ def hc_head_fuse_tilelang(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-@tilelang.jit(
+-    pass_configs=pass_configs,
+-)
++@tilelang_jit
+ def mhc_fused_block_m_tilelang(
+     comb_mix,
+     residual_in,
+@@ -1154,9 +1152,7 @@ def mhc_fused_block_m_tilelang(
+             T.pdl_trigger()
+ 
+ 
+-@tilelang.jit(
+-    pass_configs=pass_configs,
+-)
++@tilelang_jit
+ def mhc_pre_big_fuse_with_norm_reg_tilelang(
+     gemm_out_mul,
+     gemm_out_sqrsum,
+@@ -1356,9 +1352,7 @@ def mhc_pre_big_fuse_with_norm_reg_tilelang(
+             T.pdl_trigger()
+ 
+ 
+-@tilelang.jit(
+-    pass_configs=pass_configs,
+-)
++@tilelang_jit
+ def mhc_post_sqrsum_tilelang(
+     a,
+     b,
+diff --git a/vllm/models/deepseek_v4/amd/rocm.py b/vllm/models/deepseek_v4/amd/rocm.py
+index 9a49a67288..bdb3db46f7 100644
+--- a/vllm/models/deepseek_v4/amd/rocm.py
++++ b/vllm/models/deepseek_v4/amd/rocm.py
+@@ -344,17 +344,13 @@ def _build_ragged_into_graph_buffers(
+     memcpy nodes per builder per step.
+     """
+     indptr_out = ragged_indptr_buffer[: num_rows + 1]
+-    indptr_out.copy_(ragged_indptr, non_blocking=True)
+-
+-    max_entries = max(num_rows * max_entries_per_row, 1)
+-    ragged_out = ragged_indices_buffer[:max_entries]
+-    source_entries = ragged_indices.numel()
+-    if source_entries > 0:
+-        ragged_out[:source_entries].copy_(ragged_indices, non_blocking=True)
+-    if _ON_GFX950:
+-        # Preserve the graph-stable base pointer while exposing source capacity
+-        # to the sync-free split selector; indptr still carries the true NNZ.
+-        ragged_out = ragged_out[: max(source_entries, 1)]
++    ragged_out = ragged_indices_buffer[: max(num_rows * max_entries_per_row, 1)]
++    build_ragged_indices_from_dense(
++        dense_indices,
++        lengths,
++        indices_out=ragged_out,
++        indptr_out=indptr_out,
++    )
+     return ragged_out, indptr_out
+ 
+ 
+@@ -464,6 +460,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
+     # Keep fused multi-step decode disabled until update_draft_decode_metadata()
+     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
+     supports_draft_decode_metadata_update = False
++
+     def build_tile_scheduler(
+         self, num_decode_tokens: int
+     ) -> dict[str, FlashMLASchedMeta | None]:
+@@ -508,7 +505,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
+             and base.decode_swa_indices is not None
+             and base.decode_swa_lens is not None
+         ):
+-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
++            ragged_indices, ragged_indptr = _build_ragged_into_graph_buffers(
+                 base.decode_swa_indices.reshape(
+                     base.num_decode_tokens, base.decode_swa_width
+                 ),
+-- 
+2.53.0
+

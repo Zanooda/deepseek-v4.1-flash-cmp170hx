@@ -1,0 +1,75 @@
+From 51065509e1fdbdf01ed02c8becf74c3213e3c133 Mon Sep 17 00:00:00 2001
+From: jinbagi <4094424+jinbagi@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 14:58:16 +0900
+Subject: [PATCH 06/13] [Bugfix][Parser] Drop special tokens before recovery
+ buffering
+
+Assisted-by: OpenAI Codex
+Signed-off-by: jinbagi <4094424+jinbagi@users.noreply.github.com>
+(cherry picked from commit 364fd2d1ffa30d0aae6e12e98f6b1bc5be34a44e)
+---
+ tests/parser/engine/test_deepseek_v4.py       | 24 +++++++++++++++++++
+ vllm/parser/engine/streaming_parser_engine.py |  5 ++--
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/tests/parser/engine/test_deepseek_v4.py b/tests/parser/engine/test_deepseek_v4.py
+index 6641081b2a..06d4b1f8f8 100644
+--- a/tests/parser/engine/test_deepseek_v4.py
++++ b/tests/parser/engine/test_deepseek_v4.py
+@@ -752,6 +752,30 @@ class TestMalformedWrapperRecovery:
+         assert result.tool_calls == []
+         assert result.content == text
+ 
++    def test_truncated_recovery_drops_eos_special_token(self, mock_request):
++        eos_text = "<｜end▁of▁sentence｜>"
++        eos_id = 128801
++        tokenizer = make_mock_tokenizer(
++            {
++                DSML_THINK_START: _THINK_START_ID,
++                DSML_THINK_END: _THINK_END_ID,
++                eos_text: eos_id,
++            }
++        )
++        tool = _recovery_tool()
++        mock_request.tools = [tool]
++        parser = _content_recovery_parser(tokenizer, tool)
++        text = (
++            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
++            f"{_param('city', 'true', 'Seoul')}"
++        )
++
++        assert parser._engine.feed(text, []) == []
++        events = parser._engine.feed(eos_text, [eos_id])
++        events.extend(parser._engine.finish())
++
++        assert "".join(event.value for event in events if event.value) == text
++
+     def test_tool_end_without_invoke_end_stays_content(
+         self, mock_tokenizer, mock_request
+     ):
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index ade4081c3b..8229564d36 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -424,6 +424,9 @@ class StreamingParserEngine:
+         transition = self.config.transitions.get(key)
+ 
+         if transition is None:
++            # DROP_TERMINAL must never enter provisional recovery buffers.
++            if self._has_drops and terminal == DROP_TERMINAL:
++                return []
+             if self._recovery_hold_active and self.state == ParserState.TOOL_NAME:
+                 events = self._abort_recovery_hold()
+                 events.extend(self._on_terminal(terminal, value, token_count))
+@@ -433,8 +436,6 @@ class StreamingParserEngine:
+                 # no state transition. During recovery they are still part of
+                 # the candidate invoke and must stay buffered as arguments.
+                 return self._emit_for_state(value, token_count)
+-            if self._has_drops and terminal == DROP_TERMINAL:
+-                return []
+             # The projected skip state may not define the wrapper closer.
+             if self.skip_tool_parsing and terminal in self._tool_exit_terminals:
+                 self._in_skipped_tool_span = False
+-- 
+2.53.0
+
