@@ -1,7 +1,7 @@
 From 1b73403933b696a773e27471693286c3e31dd9c4 Mon Sep 17 00:00:00 2001
 From: jinbagi <4094424+jinbagi@users.noreply.github.com>
 Date: Sat, 22 Aug 2026 14:58:03 +0900
-Subject: [PATCH 04/16] [Bugfix][Parser] Require invoke end for provisional
+Subject: [PATCH 04/17] [Bugfix][Parser] Require invoke end for provisional
  recovery
 
 Assisted-by: OpenAI Codex

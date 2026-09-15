@@ -1,7 +1,7 @@
 From 51065509e1fdbdf01ed02c8becf74c3213e3c133 Mon Sep 17 00:00:00 2001
 From: jinbagi <4094424+jinbagi@users.noreply.github.com>
 Date: Sat, 22 Aug 2026 14:58:16 +0900
-Subject: [PATCH 06/16] [Bugfix][Parser] Drop special tokens before recovery
+Subject: [PATCH 06/17] [Bugfix][Parser] Drop special tokens before recovery
  buffering
 
 Assisted-by: OpenAI Codex

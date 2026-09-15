@@ -1,7 +1,7 @@
 From 356e734fe42330bb7299cbaca40cf479e86a8ecf Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <daniel.storozhev@gmail.com>
 Date: Fri, 11 Sep 2026 03:57:33 +0000
-Subject: [PATCH 10/16] Engram disk mode: gather rows with a runtime-compiled C
+Subject: [PATCH 10/17] Engram disk mode: gather rows with a runtime-compiled C
  pthread pread helper (GIL released); the Python preadv loop capped at ~125k
  syscalls/s and made a 4096-token chunk cost 1.6 s per Engram rank, capping
  prefill at ~2.5k tok/s; 3.4x faster, byte-identical

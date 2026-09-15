@@ -1,7 +1,7 @@
 From 86e5dfea4d61e4e83fc461363a640d50f2b1de5b Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Tue, 15 Sep 2026 08:56:29 +0000
-Subject: [PATCH 15/16] [Scheduler] Defer the grammar bitmask when scheduled
+Subject: [PATCH 15/17] [Scheduler] Defer the grammar bitmask when scheduled
  spec tokens are placeholders
 
 Under the async PP batch queue a structured-output request that also runs

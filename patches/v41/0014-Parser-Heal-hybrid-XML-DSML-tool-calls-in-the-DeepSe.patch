@@ -1,7 +1,7 @@
 From 5ee7697f45f04a8ffe2ba1f5e87d7fdc2e44563c Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Tue, 15 Sep 2026 08:56:17 +0000
-Subject: [PATCH 14/16] [Parser] Heal hybrid XML/DSML tool calls in the
+Subject: [PATCH 14/17] [Parser] Heal hybrid XML/DSML tool calls in the
  DeepSeek V4.1 parser
 
 In long agentic sessions the model sometimes writes a tool call in the

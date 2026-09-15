@@ -1,0 +1,372 @@
+From 0388069d3d51495bd985b4e7a59e1ba77d094996 Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Tue, 15 Sep 2026 11:06:24 +0000
+Subject: [PATCH 17/17] [Parser] Recover headless DeepSeek V4.1 tool calls by
+ inferring the tool from parameters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends the tool-call healing to the case where the model drops the invoke
+opener AND the tool name entirely, emitting only the parameter tags before
+`</｜DSML｜ invoke>`. With no name to key on, the earlier healing left the block
+as content; here the parameters identify the call.
+
+Engine: add an opt-in headless recovery path (StreamingParserEngine). When a
+provisional recovery's captured name is not a tool, instead of aborting, the
+buffered opener is reinterpreted as the first parameter, the mistaken TOOL_NAME
+events are dropped, and the hold continues in TOOL_ARGS with a deferred name.
+Before committing at `</invoke>` the engine consults a parser-supplied inferrer
+on the buffered text; if it cannot name a tool, the block is restored as text
+rather than committed as a nameless call that would silently vanish. Both hooks
+default off, so every other parser is unaffected.
+
+Parser: infer the tool as the single declared tool whose properties cover all
+parsed parameter names. A tool always covers its own parameters, so a unique
+cover is the right tool and anything ambiguous defers (stays text) — this also
+makes partial coverage safe while streaming: a common-only prefix such as
+`{"i"}` stays ambiguous until a distinctive parameter arrives, and any unique
+early match is already correct. Suppressed when tool_choice is "none".
+
+Verified against real captured headless leaks (a `bash` run and process-manager
+calls): recovered with the correct tool and valid arguments, streaming and
+non-streaming; unidentifiable blocks restored as text; wrapper-omitted
+well-formed invokes and correct DSML unchanged.
+---
+ tests/parser/engine/test_deepseek_v41.py      | 141 ++++++++++++++++++
+ vllm/parser/deepseek_v41.py                   |  69 +++++++++
+ vllm/parser/engine/streaming_parser_engine.py |  48 ++++++
+ 3 files changed, 258 insertions(+)
+
+diff --git a/tests/parser/engine/test_deepseek_v41.py b/tests/parser/engine/test_deepseek_v41.py
+index 5e124708f6..ddc279096c 100644
+--- a/tests/parser/engine/test_deepseek_v41.py
++++ b/tests/parser/engine/test_deepseek_v41.py
+@@ -299,3 +299,144 @@ def test_plain_parameter_markup_in_prose_is_not_a_tool_call():
+     )
+     assert not calls
+     assert content == text
++
++
++# Headless tool calls: the model drops the invoke opener AND the tool name,
++# emitting only parameter tags. The tool is inferred from the parameter names
++# (a tool always covers its own parameters, so a unique cover is the right
++# tool; anything ambiguous is left as text). Fixtures mirror real captured
++# leaks from a coding agent (a `bash` run and a process-manager `proc` call).
++
++_HEADLESS_TOOLS = [
++    {
++        "type": "function",
++        "function": {
++            "name": "bash",
++            "parameters": {
++                "type": "object",
++                "required": ["command", "i"],
++                "properties": {
++                    "command": {"type": "string"},
++                    "i": {"type": "string"},
++                },
++            },
++        },
++    },
++    {
++        "type": "function",
++        "function": {
++            "name": "proc",
++            "parameters": {
++                "type": "object",
++                "required": ["op", "i"],
++                "properties": {
++                    "i": {"type": "string"},
++                    "op": {"type": "string"},
++                    "name": {"type": "string"},
++                    "application": {"type": "string"},
++                    "args": {"type": "array"},
++                },
++            },
++        },
++    },
++]
++
++# The command is the fused first parameter (plain open, DSML close); `command`
++# belongs only to `bash`.
++_HEADLESS_BASH = (
++    "Now fixing your device:\n\n"
++    '<parameter name="command" string="true">cd /srv && ls</parameter>\n'
++    '<parameter name="i">Listing the tree</｜DSML｜ parameter>\n'
++    "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++)
++# The first parameter is the shared `i`; the tool only resolves once `op` and
++# `application` arrive, which name `proc` uniquely.
++_HEADLESS_PROC = (
++    "Starting the build:\n\n"
++    '<parameter name="i">Starting the image build</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="op" string="true">start</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="name" string="true">build-x</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="application" string="true">./b.sh</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="args" string="false">["x"]</｜DSML｜ parameter>\n'
++    "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++)
++
++
++@pytest.mark.parametrize(
++    ("text", "preamble", "tool", "expected"),
++    [
++        (
++            _HEADLESS_BASH,
++            "Now fixing your device:",
++            "bash",
++            {"command": "cd /srv && ls", "i": "Listing the tree"},
++        ),
++        (
++            _HEADLESS_PROC,
++            "Starting the build:",
++            "proc",
++            {
++                "i": "Starting the image build",
++                "op": "start",
++                "name": "build-x",
++                "application": "./b.sh",
++                "args": ["x"],
++            },
++        ),
++    ],
++)
++def test_headless_tool_call_is_recovered_by_inference(text, preamble, tool, expected):
++    tokenizer, tokens = tokenizer_for(text, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    reasoning, content, calls = parser.parse(
++        text,
++        _test_request(tools=_HEADLESS_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert [call.name for call in calls] == [tool]
++    assert json.loads(calls[0].arguments) == expected
++    assert (content or "").strip() == preamble
++    for marker in ("DSML", "<parameter", "</invoke>", "</calls>"):
++        assert marker not in (content or "")
++
++
++@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
++def test_headless_tool_call_is_recovered_streaming(chunk_size):
++    tokenizer, tokens = tokenizer_for(_HEADLESS_PROC, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    output = collect_output(
++        replay_streaming(
++            parser,
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=_HEADLESS_TOOLS,
++            prompt_token_ids=[51],
++        )
++    )
++    assert [c["name"] for c in output.tool_calls] == ["proc"]
++    assert json.loads(output.tool_calls[0]["arguments"])["op"] == "start"
++    for marker in ("DSML", "<parameter"):
++        assert marker not in output.content
++
++
++def test_unidentifiable_headless_block_is_restored_as_text_not_dropped():
++    """A headless block whose parameters name no tool must be left as content,
++    never committed as a nameless call (which would silently drop the text)."""
++    text = (
++        "Doing it:\n\n"
++        '<parameter name="zzz" string="true">v</｜DSML｜ parameter>\n'
++        '<｜DSML｜ parameter name="qqq" string="true">w</｜DSML｜ parameter>\n'
++        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++    )
++    tokenizer, tokens = tokenizer_for(text, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    reasoning, content, calls = parser.parse(
++        text,
++        _test_request(tools=_HEADLESS_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert not calls
++    assert "zzz" in (content or "") and "qqq" in (content or "")
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index e2cc7435ad..3b671aa76f 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -100,6 +100,55 @@ def _needs_heal(raw_args: str) -> bool:
+     return False
+ 
+ 
++def _iter_tool_meta(tools):
++    """Yield ``(name, properties, required)`` for each tool, across shapes."""
++    for tool in tools or []:
++        if isinstance(tool, dict):
++            fn = tool.get("function") or tool
++            tname = fn.get("name")
++            params = fn.get("parameters")
++        else:
++            fn = getattr(tool, "function", None)
++            if fn is not None:
++                tname = getattr(fn, "name", None)
++                params = getattr(fn, "parameters", None)
++            else:
++                tname = getattr(tool, "name", None)
++                params = getattr(tool, "parameters", None)
++        if not tname or not isinstance(params, dict):
++            continue
++        yield tname, (params.get("properties") or {}), list(params.get("required") or [])
++
++
++def _infer_tool_from_params(raw_args: str, tools) -> str | None:
++    """Infer the tool of a headless call from its parameter names.
++
++    The model sometimes drops the invoke opener and the tool name entirely and
++    emits only ``<parameter …>`` tags. The parameters still identify the tool:
++    return the single declared tool whose properties cover every parsed
++    parameter name (breaking a tie by which tool also has all its required
++    parameters present). Returns None when nothing matches uniquely, so an
++    ambiguous or unrelated block is never misrouted.
++    """
++    names = {m.group(1) for m in _HEAL_OPEN.finditer(raw_args)}
++    if not names:
++        return None
++    # Only match on property coverage: a tool always covers its own
++    # parameters, so a unique cover is always the right tool, and anything
++    # ambiguous defers (returns None) rather than guessing. This also makes
++    # partial coverage during streaming safe -- any unique early match is the
++    # real tool, and a common-only prefix (e.g. just {"i"}) stays ambiguous
++    # until a distinctive parameter arrives.
++    candidates = [
++        tname
++        for tname, props, _required in _iter_tool_meta(tools)
++        if props and names <= set(props)
++    ]
++    if len(candidates) == 1:
++        return candidates[0]
++    return None
++
++
+ def _tool_parameters(tools, name: str | None):
+     """Return ``(properties, required)`` for ``name`` across tool shapes."""
+     props = (find_tool_properties(tools, name) or {}) if name else {}
+@@ -262,6 +311,26 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+ class DeepSeekV41Parser(DeepSeekV4Parser):
+     parser_config = staticmethod(deepseek_v41_config)
+ 
++    def __init__(self, tokenizer, tools=None, **kwargs) -> None:
++        super().__init__(tokenizer, tools, **kwargs)
++        # Recover headless tool calls: blocks the model emits with no invoke
++        # opener and no tool name, only parameters. The tool is inferred from
++        # the parameters, checked at commit so an unidentifiable block is
++        # restored as text, and set as the call's name by _try_extract_name.
++        self._engine.recovery_headless_enabled = True
++        self._engine.recovery_headless_tool_inferrer = self._infer_headless_tool
++
++    def _infer_headless_tool(self, raw_args: str) -> str | None:
++        if self._recovery_suppressed or not self._recovery_request_tools:
++            return None
++        return _infer_tool_from_params(raw_args, self._recovery_request_tools)
++
++    def _try_extract_name(self, idx: int) -> str | None:
++        name = super()._try_extract_name(idx)
++        if name:
++            return name
++        return self._infer_headless_tool(self._tool_slots[idx].args)
++
+     def _convert_args(self, raw_args: str, partial: bool) -> str:
+         # A well-formed DSML call keeps the exact base conversion path; only a
+         # blob carrying the plain/hybrid idiom is healed, with the tool schema
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index 8229564d36..ed1b6f4475 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -174,6 +174,16 @@ class StreamingParserEngine:
+         # transitions. It intentionally survives reset() so the owning
+         # ParserEngine can bind a stable callback once at construction.
+         self.recovery_tool_name_validator: Callable[[str], bool] | None = None
++        # Opt-in (parser-owned, survives reset): when a provisional recovery's
++        # captured name is not a tool, treat the block as a headless tool call
++        # (opener and tool name dropped, only parameters emitted) instead of
++        # aborting. The parser infers the tool from the parameters at commit.
++        self.recovery_headless_enabled: bool = False
++        # Returns the inferred tool name for a headless block's raw text, or
++        # None when it cannot be identified. Consulted before committing a
++        # headless recovery so an unidentifiable block is restored as text
++        # rather than committed as a nameless call and silently dropped.
++        self.recovery_headless_tool_inferrer: Callable[[str], str | None] | None = None
+         self.reset(initial_state=initial_state)
+ 
+     @property
+@@ -225,6 +235,7 @@ class StreamingParserEngine:
+         self._recovery_prior_state = self.state
+         self._recovery_prior_tool_index = -1
+         self._recovery_outer_closer_pending = False
++        self._recovery_headless = False
+ 
+     def feed(
+         self,
+@@ -608,6 +619,8 @@ class StreamingParserEngine:
+         if self.state == ParserState.TOOL_NAME:
+             validator = self.recovery_tool_name_validator
+             if validator is None or not validator(self._recovery_hold_name):
++                if self.recovery_headless_enabled:
++                    return self._begin_headless_from_hold()
+                 return self._abort_recovery_hold()
+             self._recovery_hold_events.extend(
+                 self._run_transition(transition, value, token_count)
+@@ -617,6 +630,12 @@ class StreamingParserEngine:
+         if self.state == ParserState.TOOL_ARGS:
+             if not transition.commit_provisional_tool_call:
+                 return self._abort_recovery_hold()
++            if self._recovery_headless:
++                inferrer = self.recovery_headless_tool_inferrer
++                if inferrer is None or inferrer(self._recovery_hold_raw) is None:
++                    # The parameters name no tool; restore the block as text
++                    # instead of committing a nameless call that would vanish.
++                    return self._abort_recovery_hold()
+             transition_events = self._run_transition(transition, value, token_count)
+             self._recovery_hold_events.extend(transition_events)
+             events = self._recovery_hold_events
+@@ -639,12 +658,41 @@ class StreamingParserEngine:
+         self._clear_recovery_hold()
+         return self._emit_for_state_now(raw, token_count)
+ 
++    def _begin_headless_from_hold(self) -> list[SemanticEvent]:
++        """Reinterpret a name-less provisional recovery as a headless call.
++
++        The model emitted a tool call with no invoke opener and no tool name,
++        straight into its parameters, so the captured "name" is really the
++        first parameter's opening tag. Keep the buffered TOOL_CALL_START, drop
++        the mistaken TOOL_NAME events, move to TOOL_ARGS, and feed the buffered
++        text so far as argument content. The tool is inferred from the
++        parameters when the call commits (the parser's name-extraction hook);
++        if no `</invoke>` arrives, finish() aborts the hold and the whole block
++        is restored as text like any other unrecovered candidate.
++        """
++        self._recovery_hold_events = [
++            e for e in self._recovery_hold_events if e.type != EventType.TOOL_NAME
++        ]
++        self.state = ParserState.TOOL_ARGS
++        self._recovery_headless = True
++        self._recovery_hold_name = ""
++        if self._recovery_hold_raw:
++            self._recovery_hold_events.append(
++                SemanticEvent(
++                    EventType.ARG_VALUE_CHUNK,
++                    value=self._recovery_hold_raw,
++                    tool_index=self.tool_index,
++                )
++            )
++        return []
++
+     def _clear_recovery_hold(self) -> None:
+         self._recovery_hold_active = False
+         self._recovery_hold_events = []
+         self._recovery_hold_raw = ""
+         self._recovery_hold_token_count = 0
+         self._recovery_hold_name = ""
++        self._recovery_headless = False
+ 
+     def _run_transition(
+         self,
+-- 
+2.53.0
+

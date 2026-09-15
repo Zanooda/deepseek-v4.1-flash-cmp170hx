@@ -1,7 +1,7 @@
 From 68de681be340b2d47002490d3e3f4c87e012316b Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <daniel.storozhev@gmail.com>
 Date: Thu, 10 Sep 2026 07:42:39 +0000
-Subject: [PATCH 08/16] DeepSeek V4.1 on SM8x: Triton sparse-MLA attention
+Subject: [PATCH 08/17] DeepSeek V4.1 on SM8x: Triton sparse-MLA attention
  (ROCm path on Ampere), software fp8 in the V4.1 cache/indexer/engram kernels,
  wo_a bf16 dequant hook, Engram storage modes incl. disk-backed tables staged
  by the model-state hook

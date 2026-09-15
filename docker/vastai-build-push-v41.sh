@@ -38,7 +38,7 @@ EXPECTED_TREE="a731238e73f0023b0a43f6d91c07c466295224e6"
 # the published image zanooda/vllm-sm80-ds41f:v41-sm80 was built from the
 # 0001-0008 tree 70aaaced9d and runs 0009 via bind mounts). git am is checked
 # against it below so a silently fuzzed apply cannot go unnoticed).
-EXPECTED_PATCHED_TREE="${EXPECTED_PATCHED_TREE:-2b6f25124cffe41fdef9de40b62f972d3ae94848}"
+EXPECTED_PATCHED_TREE="${EXPECTED_PATCHED_TREE:-96c3fc9bc69948672cffe8f2a7bb4277735ee4b5}"
 WORK="${WORK:-/root/dsv41-build}"
 
 echo "==> target image: $REGISTRY_IMAGE"

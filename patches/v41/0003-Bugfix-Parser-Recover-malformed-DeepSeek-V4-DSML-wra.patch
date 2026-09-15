@@ -1,7 +1,7 @@
 From 5b7b6a9aee003fba4a772a08e8e717cde68c032b Mon Sep 17 00:00:00 2001
 From: jinbagi <4094424+jinbagi@users.noreply.github.com>
 Date: Sat, 22 Aug 2026 14:57:54 +0900
-Subject: [PATCH 03/16] [Bugfix][Parser] Recover malformed DeepSeek V4 DSML
+Subject: [PATCH 03/17] [Bugfix][Parser] Recover malformed DeepSeek V4 DSML
  wrappers
 
 Signed-off-by: jinbagi <4094424+jinbagi@users.noreply.github.com>

@@ -1,7 +1,7 @@
 From 9feae38c657d7f0b2d87e6b73dc130a5b5b39d65 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Tue, 15 Sep 2026 08:56:29 +0000
-Subject: [PATCH 16/16] [Tool Parser] Constrain strict tool-call parameters to
+Subject: [PATCH 16/17] [Tool Parser] Constrain strict tool-call parameters to
  their JSON schema (PR #56235)
 
 Port of upstream PR #56235 to the DeepSeek V4.1 structural-tag builder. A tool

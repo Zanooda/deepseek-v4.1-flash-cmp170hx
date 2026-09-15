@@ -1,7 +1,7 @@
 From c85b641c842bace95706b86d2c8e04e339887ad8 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <daniel.storozhev@gmail.com>
 Date: Thu, 10 Sep 2026 07:27:47 +0000
-Subject: [PATCH 02/16] patches 0002-0006 (DSpark-on-PP, prefill top-k torch
+Subject: [PATCH 02/17] patches 0002-0006 (DSpark-on-PP, prefill top-k torch
  fallback, logits row chunking) hand-ported onto the PR #56201 base
 
 ---
