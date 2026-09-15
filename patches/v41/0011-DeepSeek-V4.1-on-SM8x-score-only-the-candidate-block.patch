@@ -1,7 +1,7 @@
 From 17ac4daaa7339329cffc5914a4c0ccc2a1950d86 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Fri, 11 Sep 2026 04:49:37 +0000
-Subject: [PATCH 11/13] DeepSeek-V4.1 on SM8x: score only the candidate blocks
+Subject: [PATCH 11/16] DeepSeek-V4.1 on SM8x: score only the candidate blocks
  on the consumer index layers
 
 V4.1's two-level selection has layer 20 publish 2,048 candidate blocks of 8

@@ -1,7 +1,7 @@
 From fab59e8603aa6ff52c1ee83121ac96b42de86527 Mon Sep 17 00:00:00 2001
 From: jinbagi <4094424+jinbagi@users.noreply.github.com>
 Date: Sat, 22 Aug 2026 14:58:09 +0900
-Subject: [PATCH 05/13] [Bugfix][Parser] Preserve content after recovered DSML
+Subject: [PATCH 05/16] [Bugfix][Parser] Preserve content after recovered DSML
  invokes
 
 Assisted-by: OpenAI Codex

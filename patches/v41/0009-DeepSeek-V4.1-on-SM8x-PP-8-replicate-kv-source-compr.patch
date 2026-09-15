@@ -1,7 +1,7 @@
 From fe0b187aa52823bbc10070a161ee3fef234d79b9 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <daniel.storozhev@gmail.com>
 Date: Thu, 10 Sep 2026 22:33:23 +0000
-Subject: [PATCH 09/13] DeepSeek V4.1 on SM8x PP=8: replicate kv-source
+Subject: [PATCH 09/16] DeepSeek V4.1 on SM8x PP=8: replicate kv-source
  compressed/indexer caches across pipeline ranks (pp_share.py), keep input_ids
  on all PP ranks, skip non-local Engram tables in the loader and read
  mostly-skipped shards without mmap, intersect KV layouts across workers,

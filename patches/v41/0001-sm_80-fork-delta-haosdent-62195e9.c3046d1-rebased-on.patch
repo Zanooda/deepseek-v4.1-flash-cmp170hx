@@ -1,7 +1,7 @@
 From 66768476409a41fb7b1ed710e162ccb5dabab8c2 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <daniel.storozhev@gmail.com>
 Date: Thu, 10 Sep 2026 07:23:48 +0000
-Subject: [PATCH 01/13] sm_80 fork delta (haosdent 62195e9..c3046d1) rebased
+Subject: [PATCH 01/16] sm_80 fork delta (haosdent 62195e9..c3046d1) rebased
  onto vllm PR #56201 head 79a7108
 
 ---

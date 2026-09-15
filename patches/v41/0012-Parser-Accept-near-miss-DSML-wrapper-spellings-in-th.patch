@@ -1,7 +1,7 @@
 From 741500f528e640416bb80b4906224adff1c67873 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Fri, 11 Sep 2026 12:31:58 +0000
-Subject: [PATCH 12/13] [Parser] Accept near-miss DSML wrapper spellings in the
+Subject: [PATCH 12/16] [Parser] Accept near-miss DSML wrapper spellings in the
  DeepSeek V4.1 parser
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

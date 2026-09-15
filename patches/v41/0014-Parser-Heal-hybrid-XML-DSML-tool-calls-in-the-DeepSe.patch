@@ -1,0 +1,415 @@
+From 5ee7697f45f04a8ffe2ba1f5e87d7fdc2e44563c Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Tue, 15 Sep 2026 08:56:17 +0000
+Subject: [PATCH 14/16] [Parser] Heal hybrid XML/DSML tool calls in the
+ DeepSeek V4.1 parser
+
+In long agentic sessions the model sometimes writes a tool call in the
+generic Anthropic-style XML idiom instead of DSML: the invoke as a plain
+`<invoke name="...">` or, more often, fused into the first parameter as
+`<parameter name="TOOLNAME">`, with plain `<parameter name="...">...</parameter>`
+children, converging back to real DSML tokens by the close. The opening is
+not DSML, so the state machine never entered a tool call and the whole thing,
+close tags and all, leaked into the reply as content with finish_reason stop.
+
+It compounds: once one call leaks and the harness stores that assistant turn's
+raw content in history, the model sees its own broken format echoed back and
+imitates it, so every later call in the conversation leaks the same way.
+
+Add lenient opener terminals (`<invoke name="`, `<parameter name="`) that take
+the same provisional-recovery transitions as the DSML invoke prefix, plus plain
+`</invoke>` / `</calls>` closers, and a schema-aware healing converter that
+parses the mixed DSML/plain/hybrid parameter tags. The tool schema supplies the
+parameter a fused invoke's bare leading value belongs to (the primary required
+field) and the types plain tags omit. Two gates keep it safe: the recovery only
+commits when the captured name is a declared tool, so `<parameter>`/`<invoke>`
+in ordinary prose is restored as text, and a well-formed DSML call skips the
+healing path entirely and takes the exact existing conversion.
+
+Verified against five real captured leaks (a coding agent driving a device over
+ssh): all recovered with valid JSON arguments, streaming and non-streaming,
+markup kept out of the reply; correct DSML calls unchanged.
+---
+ tests/parser/engine/test_deepseek_v41.py | 130 ++++++++++++++++
+ vllm/parser/deepseek_v41.py              | 189 +++++++++++++++++++++++
+ 2 files changed, 319 insertions(+)
+
+diff --git a/tests/parser/engine/test_deepseek_v41.py b/tests/parser/engine/test_deepseek_v41.py
+index 090ed1eb5a..5e124708f6 100644
+--- a/tests/parser/engine/test_deepseek_v41.py
++++ b/tests/parser/engine/test_deepseek_v41.py
+@@ -169,3 +169,133 @@ def test_python_argument_conversion_and_partial_values():
+         "bad": "[broken",
+         "text": "  a<b",
+     }
++
++
++# Hybrid Anthropic-XML / DSML tool-call idiom. In long agentic sessions the
++# model opens a call in plain XML (``<parameter name="TOOLNAME">`` or
++# ``<invoke name="…">``) and converges to DSML by the close. The opening is
++# not DSML, so before the healing path the whole call, close tags and all,
++# leaked into the reply as content with ``finish_reason: stop``. These
++# fixtures are trimmed from real captured leaks (a coding agent driving a
++# device over ssh).
++
++_BASH_TOOL = [
++    {
++        "type": "function",
++        "function": {
++            "name": "bash",
++            "parameters": {
++                "type": "object",
++                "required": ["command", "i"],
++                "properties": {
++                    "command": {"type": "string"},
++                    "i": {"type": "string"},
++                    "timeout": {"type": "number"},
++                },
++            },
++        },
++    }
++]
++
++# Variant A: the invoke is a plain ``<parameter name="bash">`` with a real
++# ``<parameter name="command">`` child (Anthropic-faithful).
++_HYBRID_A = (
++    'Now fixing your device:\n\n'
++    '<parameter name="bash">\n'
++    '<parameter name="command">cd /srv && grep -rn wifi.conf . | head</parameter>\n'
++    '<parameter name="i">Finding wifi.conf claims</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="timeout" string="false">60</｜DSML｜ parameter>\n'
++    "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++)
++# Variant B: the invoke and its command are fused into
++# ``<parameter name="bash">COMMAND</…parameter>``; the command survives as a
++# bare leading value mapped to the tool's primary required parameter.
++_HYBRID_B = (
++    'Starting the app:\n\n'
++    '<parameter name="bash">systemctl restart pdj-app; echo done</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="i" string="true">Restarting the app</｜DSML｜ parameter>\n'
++    '<｜DSML｜ parameter name="timeout" string="false">200</｜DSML｜ parameter>\n'
++    "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++)
++
++
++@pytest.mark.parametrize(
++    ("text", "preamble", "expected"),
++    [
++        (
++            _HYBRID_A,
++            "Now fixing your device:",
++            {
++                "command": "cd /srv && grep -rn wifi.conf . | head",
++                "i": "Finding wifi.conf claims",
++                "timeout": 60,
++            },
++        ),
++        (
++            _HYBRID_B,
++            "Starting the app:",
++            {
++                "command": "systemctl restart pdj-app; echo done",
++                "i": "Restarting the app",
++                "timeout": 200,
++            },
++        ),
++    ],
++)
++def test_hybrid_xml_tool_call_is_healed(text, preamble, expected):
++    """A tool call written in the plain/hybrid XML idiom is recovered rather
++    than leaked into content, with its markup kept out of the reply."""
++    tokenizer, tokens = tokenizer_for(text, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    reasoning, content, calls = parser.parse(
++        text,
++        _test_request(tools=_BASH_TOOL),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert [call.name for call in calls] == ["bash"]
++    assert json.loads(calls[0].arguments) == expected
++    # The plan sentence stays as content; none of the markup leaks.
++    assert (content or "").strip() == preamble
++    for marker in ("DSML", "<parameter", "<invoke", "</invoke>", "</calls>"):
++        assert marker not in (content or "")
++
++
++@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
++def test_hybrid_xml_tool_call_is_healed_streaming(chunk_size):
++    tokenizer, tokens = tokenizer_for(_HYBRID_A, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    output = collect_output(
++        replay_streaming(
++            parser,
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=_BASH_TOOL,
++            prompt_token_ids=[51],
++        )
++    )
++    assert [call["name"] for call in output.tool_calls] == ["bash"]
++    assert json.loads(output.tool_calls[0]["arguments"]) == {
++        "command": "cd /srv && grep -rn wifi.conf . | head",
++        "i": "Finding wifi.conf claims",
++        "timeout": 60,
++    }
++    for marker in ("DSML", "<parameter", "<invoke"):
++        assert marker not in output.content
++
++
++def test_plain_parameter_markup_in_prose_is_not_a_tool_call():
++    """A ``<parameter name="X">`` whose name is not a declared tool must stay
++    as ordinary text; the recovery path is gated by the tool-name validator."""
++    text = 'Use it like <parameter name="foo">bar</parameter> in your prompt.'
++    tokenizer, tokens = tokenizer_for(text, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    reasoning, content, calls = parser.parse(
++        text,
++        _test_request(tools=_BASH_TOOL),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert not calls
++    assert content == text
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index 8e3973a46f..e2cc7435ad 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -3,6 +3,7 @@
+ """DeepSeek V4.1 reasoning and spaced DSML tool calls."""
+ 
+ import functools
++import json
+ from dataclasses import replace
+ 
+ import regex as re
+@@ -10,12 +11,14 @@ import regex as re
+ from vllm.parser.deepseek_v4 import (
+     DeepSeekV4Parser,
+     _dsml_arg_converter,
++    _unwrap_wrapper_args,
+     deepseek_v4_config,
+ )
+ from vllm.parser.engine.parser_engine_config import (
+     ParserEngineConfig,
+     ParserState,
+ )
++from vllm.tool_parsers.utils import find_tool_properties
+ 
+ DSML_TOOL_START = "<｜DSML｜ calls>"
+ DSML_TOOL_END = "</｜DSML｜ calls>"
+@@ -30,6 +33,24 @@ DSML_INVOKE_END = "</｜DSML｜ invoke>"
+ DSML_PARAM_START = "<｜DSML｜ parameter"
+ DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
+ 
++# In long agentic sessions the model sometimes writes a tool call in the
++# generic Anthropic-style XML idiom instead of DSML: the invoke as a plain
++# ``<invoke name="…">`` or, more often, fused into the first parameter as
++# ``<parameter name="TOOLNAME">``, with plain ``<parameter name="…">…</parameter>``
++# children. The opening is not DSML, so the state machine never enters a tool
++# call and the whole thing, close tags and all, leaks into the reply. Once one
++# call leaks and the harness echoes that turn back in the history, the model
++# imitates its own broken format and every later call in the conversation
++# leaks the same way. These lenient opener spellings let the provisional
++# recovery path catch such a call; the tool-name validator still gates it, so
++# an ``<invoke>``/``<parameter>`` in ordinary prose is restored as text unless
++# its name is a declared tool. The arguments are recovered by the healing
++# converter below.
++DSML_INVOKE_PREFIX_XML = '<invoke name="'
++DSML_INVOKE_PREFIX_PARAM = '<parameter name="'
++DSML_INVOKE_END_XML = "</invoke>"
++DSML_TOOL_END_XML = ("</calls>", "</function_calls>")
++
+ _PARAM_RE = re.compile(
+     r'<｜DSML｜ parameter\s+name="([^"]+)"\s+string="(true|false)">'
+     r"(.*?)"
+@@ -42,6 +63,134 @@ _PARTIAL_PARAM_RE = re.compile(
+     re.DOTALL,
+ )
+ 
++# Tolerant parameter matchers used only on a call that already tripped the
++# hybrid-idiom detector. They accept a DSML, plain, or mixed open/close and an
++# optional ``string="…"`` type hint (plain tags omit it).
++_HEAL_OPEN = re.compile(
++    r'<(?:｜DSML｜ )?parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>',
++    re.DOTALL,
++)
++_HEAL_CLOSE = re.compile(r"</(?:｜DSML｜ )?parameter>")
++_HEAL_INVOKE_CLOSE = re.compile(r"</(?:｜DSML｜ )?(?:invoke|calls|function_calls)>")
++# A plain (non-DSML) ``<parameter …>``/``<invoke …>`` open is the signature of
++# the hybrid idiom. The negative lookahead keeps a well-formed DSML open
++# (``<｜DSML｜ parameter …>``) from matching.
++_HEAL_PLAIN_OPEN = re.compile(r'<(?!｜DSML｜ )(?:parameter|invoke)\s+name="')
++
++
++def _needs_heal(raw_args: str) -> bool:
++    """Does this argument blob carry the plain/hybrid tool-call idiom?
++
++    Well-formed DSML arguments never match, so a correct call keeps the exact
++    existing conversion path.
++    """
++    if _HEAL_PLAIN_OPEN.search(raw_args):
++        return True
++    # A leading value with no open before its close is the fused-invoke case
++    # (``<parameter name="bash">COMMAND</…parameter>``): the opener was
++    # consumed as the tool name, leaving the command as a bare leading value.
++    first_open = _HEAL_OPEN.search(raw_args)
++    first_close = _HEAL_CLOSE.search(raw_args)
++    if (
++        first_close is not None
++        and (first_open is None or first_close.start() < first_open.start())
++        and raw_args[: first_close.start()].strip()
++    ):
++        return True
++    return False
++
++
++def _tool_parameters(tools, name: str | None):
++    """Return ``(properties, required)`` for ``name`` across tool shapes."""
++    props = (find_tool_properties(tools, name) or {}) if name else {}
++    required: list = []
++    if name:
++        for tool in tools or []:
++            if isinstance(tool, dict):
++                fn = tool.get("function") or tool
++                tname = fn.get("name")
++                params = fn.get("parameters")
++            else:
++                fn = getattr(tool, "function", None)
++                if fn is not None:
++                    tname = getattr(fn, "name", None)
++                    params = getattr(fn, "parameters", None)
++                else:
++                    tname = getattr(tool, "name", None)
++                    params = getattr(tool, "parameters", None)
++            if tname == name and isinstance(params, dict):
++                required = list(params.get("required") or [])
++                break
++    return props, required
++
++
++def _primary_param(props: dict, required: list) -> str | None:
++    """The parameter a bare leading value belongs to (the fused-invoke case)."""
++    for n in required:
++        p = props.get(n)
++        if isinstance(p, dict) and p.get("type") in (None, "string"):
++            return n
++    for n in required:
++        if n in props:
++            return n
++    for n, p in props.items():
++        if isinstance(p, dict) and p.get("type") == "string":
++            return n
++    if props:
++        return next(iter(props))
++    return required[0] if required else None
++
++
++def _healed_value(name: str, is_str: str | None, value: str, props: dict):
++    if is_str == "true":
++        return value
++    if is_str == "false":
++        try:
++            return json.loads(value)
++        except (json.JSONDecodeError, ValueError):
++            return value
++    # Plain tag with no type hint: trust the schema, else parse heuristically.
++    prop = props.get(name) if isinstance(props, dict) else None
++    if isinstance(prop, dict) and prop.get("type") == "string":
++        return value
++    try:
++        return json.loads(value)
++    except (json.JSONDecodeError, ValueError):
++        return value
++
++
++def _heal_v41_params(raw_args: str, tools, func_name: str | None) -> str:
++    """Parse a DSML/plain/hybrid argument blob into a JSON object string."""
++    props, required = _tool_parameters(tools, func_name)
++    params: dict[str, object] = {}
++
++    opens = list(_HEAL_OPEN.finditer(raw_args))
++    closes = list(_HEAL_CLOSE.finditer(raw_args))
++    open_starts = [m.start() for m in opens]
++    close_starts = [m.start() for m in closes]
++
++    first_open = open_starts[0] if open_starts else len(raw_args)
++    lead_close = next((s for s in close_starts if s < first_open), None)
++    if lead_close is not None:
++        lead = raw_args[:lead_close].strip()
++        if lead:
++            primary = _primary_param(props, required)
++            if primary:
++                params[primary] = _healed_value(primary, None, lead, props)
++
++    for m in opens:
++        name, is_str = m.group(1), m.group(2)
++        vstart = m.end()
++        ends = [s for s in close_starts if s >= vstart]
++        ends += [s for s in open_starts if s > m.start()]
++        ic = _HEAL_INVOKE_CLOSE.search(raw_args, vstart)
++        if ic:
++            ends.append(ic.start())
++        vend = min(ends) if ends else len(raw_args)
++        params[name] = _healed_value(name, is_str, raw_args[vstart:vend], props)
++
++    return json.dumps(params, ensure_ascii=False)
++
+ 
+ @functools.cache
+ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+@@ -69,6 +218,33 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+             transitions[(state, f"TOOL_END_LENIENT{i}")] = config.transitions[
+                 (state, "TOOL_END")
+             ]
++
++    # Hybrid Anthropic-XML tool-call openers. Each takes the same transitions
++    # as the DSML ``INVOKE_PREFIX`` from every state that defines one, so the
++    # provisional recovery (gated by the tool-name validator) fires on them.
++    invoke_states = [
++        state for (state, term) in config.transitions if term == "INVOKE_PREFIX"
++    ]
++    for key, literal in (
++        ("INVOKE_PREFIX_XML", DSML_INVOKE_PREFIX_XML),
++        ("INVOKE_PREFIX_PARAM", DSML_INVOKE_PREFIX_PARAM),
++    ):
++        terminals[key] = literal
++        for state in invoke_states:
++            transitions[(state, key)] = config.transitions[(state, "INVOKE_PREFIX")]
++
++    # Plain close spellings mirror the DSML invoke/tool closers.
++    terminals["INVOKE_END_XML"] = DSML_INVOKE_END_XML
++    transitions[(ParserState.TOOL_ARGS, "INVOKE_END_XML")] = config.transitions[
++        (ParserState.TOOL_ARGS, "INVOKE_END")
++    ]
++    for i, literal in enumerate(DSML_TOOL_END_XML):
++        terminals[f"TOOL_END_XML{i}"] = literal
++        for state in (ParserState.TOOL_ARGS, ParserState.TOOL_BETWEEN):
++            transitions[(state, f"TOOL_END_XML{i}")] = config.transitions[
++                (state, "TOOL_END")
++            ]
++
+     return replace(
+         config,
+         name="deepseek_v41",
+@@ -85,3 +261,16 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+ 
+ class DeepSeekV41Parser(DeepSeekV4Parser):
+     parser_config = staticmethod(deepseek_v41_config)
++
++    def _convert_args(self, raw_args: str, partial: bool) -> str:
++        # A well-formed DSML call keeps the exact base conversion path; only a
++        # blob carrying the plain/hybrid idiom is healed, with the tool schema
++        # supplying the parameter that a fused invoke's value belongs to and
++        # the types that plain tags omit.
++        if not _needs_heal(raw_args):
++            return super()._convert_args(raw_args, partial)
++        func_name = next(
++            (s.name for s in self._tool_slots if s.args == raw_args), None
++        )
++        healed = _heal_v41_params(raw_args, self._tools, func_name)
++        return _unwrap_wrapper_args(healed, self._tools, func_name)
+-- 
+2.53.0
+

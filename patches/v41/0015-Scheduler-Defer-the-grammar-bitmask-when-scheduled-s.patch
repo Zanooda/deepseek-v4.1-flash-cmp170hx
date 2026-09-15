@@ -1,0 +1,57 @@
+From 86e5dfea4d61e4e83fc461363a640d50f2b1de5b Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Tue, 15 Sep 2026 08:56:29 +0000
+Subject: [PATCH 15/16] [Scheduler] Defer the grammar bitmask when scheduled
+ spec tokens are placeholders
+
+Under the async PP batch queue a structured-output request that also runs
+DSpark speculative decoding could be killed with "grammar rejected tokens" on
+roughly a third of constrained requests. The grammar bitmask must be computed
+against the real draft tokens, which the worker only supplies once the batch
+has executed. `num_output_placeholders > 0` is not a sufficient test for "the
+scheduled spec tokens are still placeholders": a request is never rescheduled
+while in flight, so its previous output has already been processed and the
+counter is 0, yet the spec tokens scheduled for this step are still the -1
+placeholders. Computing the bitmask against them masks only the first position
+(the builder treats -1 as an invalid draft and stops), the worker verifies the
+real drafts unmasked, and the grammar later rejects the accepted tokens.
+
+Also defer when any scheduled spec token is a placeholder. Only affects
+requests with structured output; plain generation is unchanged.
+---
+ vllm/v1/core/sched/async_scheduler.py | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 56a532b809..99f099015b 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -28,8 +28,24 @@ class AsyncScheduler(Scheduler):
+             if request.is_prefill_chunk:
+                 continue
+ 
++            # The grammar bitmask must be computed against the real draft tokens,
++            # which the worker only supplies once the batch has executed (the
++            # engine's deferred path). `num_output_placeholders > 0` is not a
++            # sufficient test for "the scheduled spec tokens are placeholders":
++            # under the PP batch queue a request is never rescheduled while in
++            # flight, so its previous output has already been processed and the
++            # counter is 0, yet the spec tokens scheduled for this step are still
++            # the -1 placeholders. Computing the bitmask against them masks only
++            # the first position (the builder treats -1 as an invalid draft and
++            # stops masking), the worker verifies the real drafts unmasked, and
++            # the grammar later rejects the accepted tokens and kills the request.
++            scheduled_spec = spec_decode_tokens.get(req_id, ())
+             scheduler_output.pending_structured_output_tokens |= (
+-                request.use_structured_output and request.num_output_placeholders > 0
++                request.use_structured_output
++                and (
++                    request.num_output_placeholders > 0
++                    or any(token < 0 for token in scheduled_spec)
++                )
+             )
+             # The request will generate num_sampled_tokens_per_step new tokens
+             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
+-- 
+2.53.0
+

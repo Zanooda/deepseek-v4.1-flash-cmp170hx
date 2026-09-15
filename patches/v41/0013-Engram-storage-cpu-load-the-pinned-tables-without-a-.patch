@@ -1,7 +1,7 @@
 From 9743f741ebf2167df60f4a78af7fe8423f902dda Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Fri, 11 Sep 2026 15:14:22 +0000
-Subject: [PATCH 13/13] Engram storage=cpu: load the pinned tables without a
+Subject: [PATCH 13/16] Engram storage=cpu: load the pinned tables without a
  host-memory transient
 
 Two things made `--engram-config '{"storage":"cpu"}'` OOM-kill the two

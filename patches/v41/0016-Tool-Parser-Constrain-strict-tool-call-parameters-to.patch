@@ -1,0 +1,420 @@
+From 9feae38c657d7f0b2d87e6b73dc130a5b5b39d65 Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Tue, 15 Sep 2026 08:56:29 +0000
+Subject: [PATCH 16/16] [Tool Parser] Constrain strict tool-call parameters to
+ their JSON schema (PR #56235)
+
+Port of upstream PR #56235 to the DeepSeek V4.1 structural-tag builder. A tool
+sent with `strict: true` now has its parameter values lowered to the tool's
+JSON schema (string enums/const/pattern/length, JSON-typed values, local
+`$ref` resolution against the root `$defs`), instead of accepting any text.
+Tools without `strict: true` keep the permissive path unchanged, so existing
+non-strict traffic is unaffected.
+---
+ .../test_structural_tag_registry.py           | 127 ++++++++--
+ vllm/tool_parsers/structural_tag_registry.py  | 219 +++++++++++++++---
+ 2 files changed, 295 insertions(+), 51 deletions(-)
+
+diff --git a/tests/tool_parsers/test_structural_tag_registry.py b/tests/tool_parsers/test_structural_tag_registry.py
+index b77b4efaff..ab7476dddd 100644
+--- a/tests/tool_parsers/test_structural_tag_registry.py
++++ b/tests/tool_parsers/test_structural_tag_registry.py
+@@ -80,11 +80,50 @@ def test_supported_structural_tag_models_include_vllm_builtins():
+     assert "hermes" in VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
+ 
+ 
++@pytest.fixture
++def v41_schema_tools() -> list[ChatCompletionToolsParam]:
++    return [
++        ChatCompletionToolsParam(
++            type="function",
++            function={
++                "name": "get_weather",
++                "strict": True,
++                "parameters": {
++                    "type": "object",
++                    "properties": {
++                        "city": {"type": "string"},
++                        "unit": {"type": "string", "enum": ["C", "F"]},
++                        "days": {"type": "integer", "minimum": 1},
++                        "zip": {"type": "string", "pattern": "[0-9]{5}"},
++                    },
++                    "required": ["city"],
++                    "additionalProperties": False,
++                },
++            },
++        )
++    ]
++
++
++def _v41_param(name: str, value: str, string: str = "true") -> str:
++    return (
++        f'<｜DSML｜ parameter name="{name}" string="{string}">{value}'
++        "</｜DSML｜ parameter>\n"
++    )
++
++
++_V41_BEGIN = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n'
++_V41_END = "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++
++
+ @pytest.mark.parametrize("choice", ["auto", "required", "get_weather"])
+-def test_deepseek_v41_format_constraints_ignore_parameter_schema(
++def test_deepseek_v41_strict_tools_constrain_parameter_schema(
+     choice,
+-    sample_tools_strict,
++    v41_schema_tools,
+ ):
++    """Ported from vLLM PR #56235 (Rust frontend): strict tools emit declared
++    parameters in schema order, required ones mandatory, optional ones
++    skippable; string values follow enum/pattern, other types their JSON
++    schema; unknown names are rejected when the object is closed."""
+     tool_choice = (
+         ChatCompletionNamedToolChoiceParam(
+             function=ChatCompletionNamedFunction(name=choice)
+@@ -93,29 +132,89 @@ def test_deepseek_v41_format_constraints_ignore_parameter_schema(
+         else choice
+     )
+     tag = get_model_structural_tag(
+-        "deepseek_v41", sample_tools_strict, tool_choice, reasoning=False
++        "deepseek_v41", v41_schema_tools, tool_choice, reasoning=False
+     )
+     grammar = Grammar.from_structural_tag(tag)
+-    begin = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n'
+-    end = "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++    city = _v41_param("city", "Lisbon")
++    accept = lambda body: _is_grammar_accept_string(grammar, _V41_BEGIN + body + _V41_END)  # noqa: E731
++    # required only; optional parameters skipped
++    assert accept(city)
++    # optional parameters in schema order, each constrained
++    assert accept(city + _v41_param("unit", "C") + _v41_param("days", "3", "false"))
++    assert accept(city + _v41_param("zip", "12345"))
++    # the string flag is accepted in either spelling for typed parameters
++    assert accept(_v41_param("city", "Lisbon", "false"))
++    # rejected: missing required, wrong enum value, bad pattern, non-integer
++    # days, unknown parameter name, wrong order, malformed marker
++    assert not accept("")
++    assert not accept(city + _v41_param("unit", "K"))
++    assert not accept(city + _v41_param("zip", "1234"))
++    assert not accept(city + _v41_param("days", "three", "false"))
++    assert not accept(city + _v41_param("undeclared", "x"))
++    assert not accept(_v41_param("unit", "C") + city)
++    assert not accept(city.replace("｜ parameter", "｜parameter"))
++    assert not _is_grammar_accept_string(
++        grammar, (_V41_BEGIN + city + _V41_END).replace('name="get_weather"', 'name="unknown"')
++    )
++    assert _is_grammar_accept_string(grammar, "Hello") == (choice == "auto")
++
++
++@pytest.mark.parametrize("strict", [False, None])
++def test_deepseek_v41_non_strict_tools_keep_unconstrained_parameters(strict):
++    function = {
++        "name": "get_weather",
++        "parameters": {
++            "type": "object",
++            "properties": {"city": {"type": "string"}},
++            "required": ["city"],
++        },
++    }
++    if strict is not None:
++        function["strict"] = strict
++    tools = [ChatCompletionToolsParam(type="function", function=function)]
++    tag = get_model_structural_tag("deepseek_v41", tools, "required", reasoning=False)
++    grammar = Grammar.from_structural_tag(tag)
+     parameter = (
+         '<｜DSML｜ parameter name="undeclared" string="false">'
+         '{"nested": [true, null, 1.5]}</｜DSML｜ parameter>\n'
+     )
+-    # Required city is omitted; extra and repeated fields remain unconstrained.
+-    assert _is_grammar_accept_string(grammar, begin + end)
+-    assert _is_grammar_accept_string(grammar, begin + parameter * 2 + end)
++    # Required city omitted; extra and repeated fields remain unconstrained.
++    assert _is_grammar_accept_string(grammar, _V41_BEGIN + _V41_END)
++    assert _is_grammar_accept_string(grammar, _V41_BEGIN + parameter * 2 + _V41_END)
+     assert not _is_grammar_accept_string(
+         grammar,
+-        begin + parameter.replace('{"nested": [true, null, 1.5]}', "invalid") + end,
+-    )
+-    assert not _is_grammar_accept_string(
+-        grammar, (begin + end).replace('name="get_weather"', 'name="unknown"')
++        _V41_BEGIN + parameter.replace('{"nested": [true, null, 1.5]}', "invalid") + _V41_END,
+     )
++
++
++def test_deepseek_v41_strict_tool_with_nested_object_and_ref():
++    tools = [
++        ChatCompletionToolsParam(
++            type="function",
++            function={
++                "name": "book",
++                "strict": True,
++                "parameters": {
++                    "type": "object",
++                    "$defs": {"Span": {"type": "object", "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}}, "required": ["start", "end"], "additionalProperties": False}},
++                    "properties": {"span": {"$ref": "#/$defs/Span"}, "note": {}},
++                    "required": ["span"],
++                    "additionalProperties": False,
++                },
++            },
++        )
++    ]
++    tag = get_model_structural_tag("deepseek_v41", tools, "required", reasoning=False)
++    grammar = Grammar.from_structural_tag(tag)
++    begin = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="book">\n'
++    span = _v41_param("span", '{"start": 1, "end": 2}', "false")
++    assert _is_grammar_accept_string(grammar, begin + span + _V41_END)
++    # untyped parameter: raw text or any JSON
++    assert _is_grammar_accept_string(grammar, begin + span + _v41_param("note", "free text") + _V41_END)
++    assert _is_grammar_accept_string(grammar, begin + span + _v41_param("note", "[1, 2]", "false") + _V41_END)
+     assert not _is_grammar_accept_string(
+-        grammar, begin + parameter.replace("｜ parameter", "｜parameter") + end
++        grammar, begin + _v41_param("span", '{"start": 1}', "false") + _V41_END
+     )
+-    assert _is_grammar_accept_string(grammar, "Hello") == (choice == "auto")
+ 
+ 
+ def test_deepseek_v41_named_choice_emits_one_call(sample_tools):
+diff --git a/vllm/tool_parsers/structural_tag_registry.py b/vllm/tool_parsers/structural_tag_registry.py
+index 34e57840be..ad4e92b6ee 100644
+--- a/vllm/tool_parsers/structural_tag_registry.py
++++ b/vllm/tool_parsers/structural_tag_registry.py
+@@ -233,6 +233,183 @@ _V41_INVOKE_END = "</｜DSML｜ invoke>"
+ _V41_PARAMETER_END = "</｜DSML｜ parameter>"
+ 
+ 
++_V41_STRING_ATOM = "(?:[^<]|<[^｜])"  # any char, never the start of a DSML marker
++_V41_JSON_TYPES = {"integer", "number", "boolean", "null", "object", "array"}
++_V41_VALUE_EXCLUDES = [_V41_PARAMETER_END, _V41_INVOKE_END, _V41_CALLS_END]
++
++
++def _v41_resolve_ref(schema: Any, root_defs: dict[str, Any]) -> Any:
++    """Follow local ``#/$defs/NAME`` / ``#/definitions/NAME`` references (at most
++    8 hops). A sibling ``type`` next to ``$ref`` wins over the target's."""
++    for _ in range(8):
++        if not isinstance(schema, dict) or "$ref" not in schema:
++            return schema
++        ref = schema["$ref"]
++        target = None
++        if isinstance(ref, str):
++            for prefix in ("#/$defs/", "#/definitions/"):
++                if ref.startswith(prefix):
++                    target = root_defs.get(ref[len(prefix) :])
++        if not isinstance(target, dict):
++            return {k: v for k, v in schema.items() if k != "$ref"} or True
++        merged = dict(target)
++        merged.update({k: v for k, v in schema.items() if k != "$ref"})
++        schema = merged
++    return schema
++
++
++def _v41_attach_root_definitions(schema: Any, root_defs: dict[str, Any]) -> Any:
++    if not root_defs or not isinstance(schema, dict):
++        return schema
++    out = dict(schema)
++    out.setdefault("$defs", {}).update(
++        {k: v for k, v in root_defs.items() if k not in out["$defs"]}
++    )
++    return out
++
++
++def _v41_permissive_value() -> OrFormat:
++    """The pre-schema behaviour: the model picks raw text or any JSON."""
++    return OrFormat(
++        elements=[
++            SequenceFormat(
++                elements=[
++                    ConstStringFormat(value='true">'),
++                    AnyTextFormat(excludes=_V41_VALUE_EXCLUDES),
++                ]
++            ),
++            SequenceFormat(
++                elements=[
++                    ConstStringFormat(value='false">'),
++                    JSONSchemaFormat(json_schema=True),
++                ]
++            ),
++        ]
++    )
++
++
++def _v41_permissive_parameter() -> TagFormat:
++    """Any parameter name, any value (the builder before schema lowering)."""
++    return TagFormat(
++        begin='<｜DSML｜ parameter name="',
++        content=SequenceFormat(
++            elements=[
++                RegexFormat(pattern=r'[^"]+'),
++                ConstStringFormat(value='" string="'),
++                _v41_permissive_value(),
++            ]
++        ),
++        end=f"{_V41_PARAMETER_END}\n",
++    )
++
++
++def _v41_string_value(schema: dict[str, Any]) -> Any:
++    """Raw-channel string value: enum/const literals, a pattern, length bounds,
++    else any text that does not contain a closing marker."""
++    literals = schema.get("enum")
++    if literals is None and "const" in schema:
++        literals = [schema["const"]]
++    if (
++        isinstance(literals, list)
++        and literals
++        and len(literals) <= 256
++        and all(isinstance(v, str) and "<｜" not in v for v in literals)
++    ):
++        return OrFormat(elements=[ConstStringFormat(value=v) for v in literals])
++    pattern = schema.get("pattern")
++    if isinstance(pattern, str) and pattern:
++        return RegexFormat(pattern=pattern)
++    min_len, max_len = schema.get("minLength"), schema.get("maxLength")
++    if isinstance(min_len, int) or isinstance(max_len, int):
++        lo = min_len if isinstance(min_len, int) and min_len > 0 else 0
++        hi = str(max_len) if isinstance(max_len, int) else ""
++        return RegexFormat(pattern=f"{_V41_STRING_ATOM}{{{lo},{hi}}}")
++    return AnyTextFormat(excludes=_V41_VALUE_EXCLUDES)
++
++
++def _v41_parameter_tag(
++    name: str, schema: Any, root_defs: dict[str, Any]
++) -> TagFormat:
++    """One ``<｜DSML｜ parameter name="NAME" string="...">VALUE</｜DSML｜ parameter>``
++    whose VALUE follows the parameter's JSON schema (vLLM PR #56235's rules,
++    Rust frontend, mirrored here for the Python builder):
++
++    * ``type: string`` → raw text: enum/const literals, ``pattern``, or
++      ``minLength``/``maxLength`` bounds, else any marker-free text.
++    * integer/number/boolean/null/object/array → the sub-schema as JSON
++      (objects closed unless ``additionalProperties`` allows more, per xgrammar).
++    * anything else (no type, mixed unions, ``false``) → unconstrained, i.e.
++      the model picks raw text or any JSON.
++    The ``string="true|false"`` flag is accepted in either form; only the
++    value is constrained.
++    """
++    schema = _v41_resolve_ref(schema, root_defs)
++    if isinstance(schema, dict) and "$defs" in schema:
++        root_defs = {**root_defs, **schema["$defs"]}
++    flag = OrFormat(
++        elements=[ConstStringFormat(value='true">'), ConstStringFormat(value='false">')]
++    )
++    value: Any
++    if isinstance(schema, dict):
++        typ = schema.get("type")
++        if typ == "string" or (typ is None and ("enum" in schema or "const" in schema)):
++            value = _v41_string_value(schema)
++            if typ is None and not isinstance(value, OrFormat):
++                value = None
++        elif isinstance(typ, str) and typ in _V41_JSON_TYPES:
++            value = JSONSchemaFormat(
++                json_schema=_v41_attach_root_definitions(schema, root_defs)
++            )
++        else:
++            value = None
++    else:
++        value = None
++    if value is None:
++        content: Any = SequenceFormat(
++            elements=[ConstStringFormat(value='" string="'), _v41_permissive_value()]
++        )
++    else:
++        content = SequenceFormat(
++            elements=[ConstStringFormat(value='" string="'), flag, value]
++        )
++    return TagFormat(
++        begin=f'<｜DSML｜ parameter name="{name}',
++        content=content,
++        end=f"{_V41_PARAMETER_END}\n",
++    )
++
++
++def _v41_invoke_content(tool: FunctionToolParam) -> Any:
++    """The parameter block of one invoke: schema-ordered parameters, required
++    ones mandatory, optional ones skippable; extra names only when the schema
++    allows ``additionalProperties``. Non-strict and schema-less tools keep the
++    unconstrained block."""
++    fn = tool.function
++    params = getattr(fn, "parameters", None)
++    strict = getattr(fn, "strict", None)
++    if params is False:
++        return ConstStringFormat(value="")
++    # Only strict tools get the schema lowering: OpenAI's strict defaults to
++    # false, and non-strict tools keep the name-and-syntax-only grammar (the
++    # request layer likewise only activates auto-mode grammars for strict tools).
++    if strict is not True or not isinstance(params, dict):
++        return StarFormat(content=_v41_permissive_parameter())
++    root_defs = dict(params.get("$defs") or params.get("definitions") or {})
++    props = params.get("properties")
++    if not isinstance(props, dict):
++        return StarFormat(content=_v41_permissive_parameter())
++    required = set(params.get("required") or [])
++    elements: list[Any] = []
++    for key, sub in props.items():
++        tag = _v41_parameter_tag(key, sub, root_defs)
++        elements.append(tag if key in required else OptionalFormat(content=tag))
++    if params.get("additionalProperties") is True:
++        elements.append(StarFormat(content=_v41_permissive_parameter()))
++    if not elements:
++        return ConstStringFormat(value="")
++    return SequenceFormat(elements=elements)
++
++
+ @register_vllm_structural_tag("deepseek_v41")
+ def get_deepseek_v41_structural_tag(
+     tools: list[FunctionToolParam],
+@@ -244,47 +421,15 @@ def get_deepseek_v41_structural_tag(
+     # Serving enables this visible-text grammar after the reasoning boundary.
+     del builtin_tools, reasoning, token_suffix
+ 
+-    # TODO: lower parameter schemas into DSML constraints. This builder constrains
+-    # tool names and DSML/value syntax only. Parameter names, presence, uniqueness
+-    # and value schemas remain unconstrained, including for strict=true. The request
+-    # layer still uses strict to decide whether auto tool choice activates a grammar.
+-    parameter = TagFormat(
+-        begin='<｜DSML｜ parameter name="',
+-        content=SequenceFormat(
+-            elements=[
+-                RegexFormat(pattern=r'[^"]+'),
+-                ConstStringFormat(value='" string="'),
+-                OrFormat(
+-                    elements=[
+-                        SequenceFormat(
+-                            elements=[
+-                                ConstStringFormat(value='true">'),
+-                                AnyTextFormat(
+-                                    excludes=[
+-                                        _V41_PARAMETER_END,
+-                                        _V41_INVOKE_END,
+-                                        _V41_CALLS_END,
+-                                    ]
+-                                ),
+-                            ]
+-                        ),
+-                        SequenceFormat(
+-                            elements=[
+-                                ConstStringFormat(value='false">'),
+-                                JSONSchemaFormat(json_schema=True),
+-                            ]
+-                        ),
+-                    ]
+-                ),
+-            ]
+-        ),
+-        end=f"{_V41_PARAMETER_END}\n",
+-    )
++    # Tool names, DSML framing and, since vLLM PR #56235 (ported from its Rust
++    # frontend builder), the parameter names, presence and value schemas are
++    # constrained; strict=false tools keep the earlier name-and-syntax-only
++    # grammar. Whitespace between parameters is the trained "\n" framing.
+     calls = TagsWithSeparatorFormat(
+         tags=[
+             TagFormat(
+                 begin=f'<｜DSML｜ invoke name="{tool.function.name}">\n',
+-                content=StarFormat(content=parameter),
++                content=_v41_invoke_content(tool),
+                 end=f"{_V41_INVOKE_END}\n",
+             )
+             for tool in tools
+-- 
+2.53.0
+
