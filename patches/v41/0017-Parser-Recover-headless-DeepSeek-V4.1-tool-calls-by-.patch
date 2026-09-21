@@ -1,7 +1,7 @@
 From 0388069d3d51495bd985b4e7a59e1ba77d094996 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Tue, 15 Sep 2026 11:06:24 +0000
-Subject: [PATCH 17/17] [Parser] Recover headless DeepSeek V4.1 tool calls by
+Subject: [PATCH 17/18] [Parser] Recover headless DeepSeek V4.1 tool calls by
  inferring the tool from parameters
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
