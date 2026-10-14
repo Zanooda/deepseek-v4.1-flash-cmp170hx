@@ -185,14 +185,17 @@ B30, or a BIOS/BMC option if the board has one. Do nothing if it reads "Not Acti
 ## Repo layout
 
 ```
-patches/v41/        the 13 patches on vLLM PR #56201 head 79a7108d9a; notes in patches/README.md
+patches/v41/        the 19 patches on vLLM PR #56201 head 79a7108d9a; notes in patches/README.md
 patches/            the earlier DeepSeek-V4-Flash series (0001-0009) this work built on
 docker/             Dockerfile.fullbuild and vastai-build-push-v41.sh (verifies both tree SHAs)
 launch/             run-v41-pp8.sh (PP=8 launch), warm-engram-cache.sh (page-cache Engram)
 run.sh              this box's entry point: run-v41-pp8.sh with the patched checkout and P2P
 bench/              bench_v41_check.py (coherence + needles), bench_v41_matrix.py
                     (context x concurrency), bench_v41_decode_window.py (prefill-free
-                    concurrent decode), v41_partition_trial.sh, and the raw *.jsonl
+                    concurrent decode), metrics_window.py (reads /metrics twice and
+                    reports the step composition and per-token gaps in between),
+                    spread_decode_ab.sh (spread-decode A/B), v41_partition_trial.sh,
+                    and the raw *.jsonl
 SETTINGS.md         every flag and environment variable, and why it has that value
 RESULTS.md          all measurements, correctness tests and what is not done
 ```

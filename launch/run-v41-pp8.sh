@@ -152,7 +152,7 @@ docker run -d --name dsv41 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPUS" $N
   --shm-size=16g -p "$PORT":8000 \
   "$IMG" vllm serve /model --served-model-name dsv41 \
   --pipeline-parallel-size 8 --kv-cache-dtype fp8 --block-size "${DSV41_BLOCK_SIZE:-128}" \
-  --max-model-len "$MAXLEN" --max-num-batched-tokens 4096 --trust-remote-code \
+  --max-model-len "$MAXLEN" --max-num-batched-tokens 4096 --trust-remote-code --long-prefill-token-threshold 1024 \
   --gpu-memory-utilization "$MEMUTIL" --max-num-seqs "$MAXSEQS" \
   --engram-config "{\"storage\":\"$ENGRAM\",\"disk_threads\":$ENGRAM_THREADS}" \
   --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 \
