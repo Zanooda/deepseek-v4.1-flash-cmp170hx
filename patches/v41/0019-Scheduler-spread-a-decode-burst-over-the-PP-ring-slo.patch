@@ -1,0 +1,165 @@
+From 028a183223c1a7d5c03e80a928c88012f86fd758 Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Wed, 14 Oct 2026 12:30:06 +0000
+Subject: [PATCH] [Scheduler] Spread a decode burst over the PP ring slots
+ (VLLM_DSV41_SPREAD_DECODE)
+
+With pipeline parallelism the engine keeps `max_concurrent_batches` == pp_size
+scheduler steps in flight, but the stock scheduler puts *every* runnable request
+into *every* one of them: the ring holds pp_size copies of one fused batch, each
+stage pays the full batch cost, and the ring adds no parallelism. Measured on
+8x CMP 170HX / PP=8 / DSpark5: the same 8 requests ran at 274 tok/s aggregate
+and 34 tok/s per stream when a burst was admitted in one step, and at 531 / 66
+when they joined one at a time (RESULTS.md section 4).
+
+VLLM_DSV41_SPREAD_DECODE=N caps the decodes admitted per step at N and re-arms
+each admitted request ceil(C/N) steps later (C = running decodes), so a burst
+takes C/N steps and the ring carries C/N independent batches. Prefill chunks and
+the finishing step of a fully prefix-cached prompt are exempt: spacing them out
+costs TTFT and buys no pipelining. While C <= N nothing is touched at all, which
+keeps the single-stream and low-concurrency paths on stock behaviour.
+
+Unset/0 is the default and is bit-identical to before. A/B against it with
+bench/spread_decode_ab.sh (arms 0/1/2/4, prefill-free decode window, cold and
+warm arrivals): the knob is only a win if the warm c=8 aggregate moves toward
+the cold figure without the n=1 control regressing.
+---
+ vllm/v1/core/sched/scheduler.py | 85 +++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c15f738b8a..dd90148920 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -72,6 +73,29 @@ from vllm.v1.utils import record_function_or_nullcontext
+ logger = init_logger(__name__)
+ 
+ 
++def _spread_decode_slots() -> int:
++    """``VLLM_DSV41_SPREAD_DECODE=N``: admit at most N decode requests per
++    scheduler step and re-arm each of them one ring period later.
++
++    With pipeline parallelism the engine runs ``max_concurrent_batches`` steps
++    in flight (== ``pipeline_parallel_size``), so the pipeline is only full when
++    those slots hold independent batches. The stock scheduler fills every slot
++    with *every* runnable request instead, so a burst of C requests rides as C
++    fat steps rather than C thin ones: each stage pays the full batch cost and
++    the ring buys nothing. Measured on 8x CMP 170HX, PP=8: a burst admitted in
++    one step ran at 274 tok/s aggregate and 34 tok/s per stream, the same
++    requests spread over the ring at 531 and 66. Unset or 0 keeps stock."""
++
++    raw = os.environ.get("VLLM_DSV41_SPREAD_DECODE") or "0"
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        logger.warning_once(
++            "VLLM_DSV41_SPREAD_DECODE=%r is not an integer; ignoring it", raw
++        )
++        return 0
++
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -319,6 +343,11 @@ class Scheduler(SchedulerInterface):
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
++        # V4.1/sm_80 climbing aid (VLLM_DSV41_SPREAD_DECODE): decodes admitted in
++        # the current step, and the ring period used to re-arm them.
++        self.spread_decode_slots = _spread_decode_slots()
++        self._spread_admitted = 0
++        self._spread_period = 1
+         # DP prefill balancing: Flag to track whether the last cadence-aligned
+         # prefill batch fully drained the waiting queue. Prefill throttling
+         # is disabled in this case.
+@@ -507,8 +536,46 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++    def _spread_candidates(self) -> int:
++        """Running requests currently decoding (prompt already computed)."""
++        return sum(1 for request in self.running if self._is_spread_decode(request))
++
++    def _is_spread_decode(self, request: Request) -> bool:
++        """True for a step that is a decode, i.e. not prompt processing.
++
++        A prefill chunk is exempt: delaying it costs TTFT and buys no
++        pipelining, since only decode steps need to occupy separate slots of
++        the PP ring. The finishing step of a fully prefix-cached prompt still
++        counts as prefill here (``num_computed_tokens < num_prompt_tokens``), so
++        a burst is spaced from its second step on; the first is one token each.
++        """
++        return (
++            not request.is_prefill_chunk
++            and request.num_computed_tokens >= request.num_prompt_tokens
++        )
++
++    def _prepare_spread_decode(self) -> None:
++        """Size this step's decode admission cap and the re-arm period.
++
++        Period = the ring slot count, so C requests share the ring as
++        ``ceil(C / slots)`` phases instead of fusing into one batch. Nothing is
++        touched while the decodes already fit in one step (C <= slots), which
++        keeps the single-stream and low-concurrency cases on the stock path.
++        A period shorter than ``pipeline_parallel_size`` is fine: the stock
++        scheduler re-admits every step (period 1), so the ring tolerates it.
++        """
++        self._spread_admitted = 0
++        if not self.spread_decode_slots:
++            return
++        candidates = self._spread_candidates()
++        if candidates <= self.spread_decode_slots:
++            self._spread_period = 1
++            return
++        self._spread_period = -(-candidates // self.spread_decode_slots)
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._prepare_spread_decode()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -585,6 +652,17 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            if (
++                self.spread_decode_slots
++                and self._spread_admitted >= self.spread_decode_slots
++                and self._is_spread_decode(request)
++            ):
++                # V4.1/sm_80: keep this step's batch thin. The requests skipped
++                # here are due (or become due next step) and take other slots of
++                # the PP ring, instead of fusing into this batch.
++                req_index += 1
++                continue
++
+             if defer_prefills and request.is_prefill_chunk:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+@@ -735,6 +813,13 @@ class Scheduler(SchedulerInterface):
+             num_scheduled_tokens[request_id] = num_new_tokens
+             token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
++            if self.spread_decode_slots and self._is_spread_decode(request):
++                # V4.1/sm_80: this decode keeps its ring slot for one period, so
++                # the next steps hand the remaining slots to other requests.
++                self._spread_admitted += 1
++                request.next_decode_eligible_step = (
++                    self.current_step + self._spread_period
++                )
+             req_index += 1
+ 
+             # Speculative decode related.
+-- 
+2.53.0
+

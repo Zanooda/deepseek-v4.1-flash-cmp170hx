@@ -47,6 +47,8 @@ does both and checks both tree SHAs.
 | v41/0017 | **headless tool-call recovery** | the harder half of 0014: the model sometimes drops the invoke opener *and* the tool name too, emitting only the `<parameter …>` tags before `</｜DSML｜ invoke>`. With no name to key on, the tool is inferred from the parameters — the single declared tool whose properties cover every parsed parameter name — with an opt-in headless path in the shared `StreamingParserEngine` (reinterpret the buffered opener as the first parameter, defer the name, confirm a tool can be named before committing) | a tool always covers its own parameters, so a unique cover is the right tool and anything ambiguous stays text; the commit-time check restores an unidentifiable block as text rather than dropping it, streaming inference is safe (a common-only prefix like `{"i"}` defers until a distinctive parameter arrives), and it is suppressed under `tool_choice:"none"`. Both engine hooks default off, so no other parser is touched. Python-only, bind-mounted like 0009 |
 | v41/0018 | **fail-closed spec-decode drafts on constrained bitmask rows** | port of upstream [PR #54442](https://github.com/vllm-project/vllm/pull/54442): fixes the recurring `grammar rejected tokens` / `Failed to advance FSM … Terminating request` kills on grammar-constrained requests (structural-tag tool calls) under DSpark. When a draft hand-off drops tokens the bitmask fills every row after the first `-1` with the permissive `_full_mask`, so the rejection sampler can accept a draft verified against an unconstrained row; the grammar then rejects it and terminates the request. The scheduler records `num_acceptable_drafts` (leading drafts the bitmask really constrained), the runner computes the positions past it, and the rejection sampler verifies against a copy of `draft_sampled` with those set to `-1` — pinning the accepted length before a permissive row | runs in the **plain `Scheduler`** path this server uses (async scheduling is off, so our 0015 AsyncScheduler deferral never executes and did **not** cover this); fail-closed and independent of the scheduler. `output.py`/`batch_shard.py`/`rejection_sampler.py` applied from the PR unchanged, `scheduler.py`/`model_runner.py` hand-merged around the sm_80 patches, `strip_speculative_padding` added to `structured_output/utils.py` (absent from our base). Python-only, bind-mounted like 0009 |
 
+| v41/0019 | **spread a decode burst over the PP ring slots** | `VLLM_DSV41_SPREAD_DECODE=N` caps the decodes admitted per scheduler step at N and re-arms each admitted request `ceil(C/N)` steps later (C = running decodes), so a burst of C requests takes C/N steps and the engine's `max_concurrent_batches` (== pp_size) slots carry independent batches instead of one fused batch. Prefill chunks and the finishing step of a fully prefix-cached prompt are exempt; while `C <= N` nothing is touched, so single-stream keeps stock behaviour | **off by default (unset/0 is bit-identical to stock)** — the win is not proven yet, see the note below and `bench/spread_decode_ab.sh`. Python-only, bind-mounted like 0009 |
+
 **Not carried, because upstream has them:** 0008 (NaN guard: `rejection_sampler_utils.py:111`
 upstream) and 0009 (`is_current_stream_capturing` guard + no `eager_scratch.py` upstream).
 
@@ -139,6 +141,31 @@ decode 48 rows × 131k 2.4 → 0.32 ms, 8 rows × 1M 3.0 → 0.16 ms. In the eng
 grew from 2,827,499 to 3,151,289 tokens (profiling no longer sees the full-width transient);
 needles 13/13 after the change. Decode-step impact is small because the indexer was a
 smaller slice of the step than estimated — numbers in [RESULTS](../RESULTS.md).
+
+### v41/0019 — spreading a decode burst (off by default, unproven)
+
+The engine keeps `pp_size` (= 8 here) scheduler steps in flight — `max_concurrent_batches`
+in `vllm/config/vllm.py:577`, the `step_with_batch_queue` ring in `vllm/v1/engine/core.py`
+— but the stock scheduler puts every runnable request into every one of those steps. A
+burst therefore rides as N copies of one fused batch, and since each stage then pays the
+full batch cost, the ring buys nothing. Measured (RESULTS §4): the same 8 requests ran
+**274 tok/s aggregate / 34 per stream** when admitted together and **531 / 66** when they
+joined one at a time; the 8 s-stagger run in between gave 389. Which is why this patch is
+an experiment, not a claimed fix: the fused/spread difference is real and reproducible, but
+the mechanism above is inferred from the arrival experiments, and no per-rank decode
+profile exists to confirm it (RESULTS §10).
+
+What it does: `VLLM_DSV41_SPREAD_DECODE=N` admits at most N decodes per step and re-arms
+each admitted request `ceil(C/N)` steps later, C being the running decodes, so the burst
+occupies `ceil(C/N)` steps and the ring carries that many independent batches. Prefill
+chunks (and the finishing step of a fully prefix-cached prompt, which still counts as
+prefill) are exempt — spacing those costs TTFT and buys no pipelining. While `C <= N`
+neither the cap nor the period is applied, so single-stream and low-concurrency traffic
+stay bit-identical to stock. Verified: `py_compile`, a simulation of the admission
+arithmetic (no step ends up empty, no request starves, cadence = period for C from 1 to
+16 and N from 1 to 8), and the flag is off by default. Not verified: anything on hardware —
+`bench/spread_decode_ab.sh` is the A/B (arms 0/1/2/4, prefill-free decode window, cold and
+warm arrivals, whole n=1..16 curve per run).
 
 ### What was verified, and what was not
 

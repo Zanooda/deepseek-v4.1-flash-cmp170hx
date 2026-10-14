@@ -127,6 +127,10 @@ else
   echo "         series and set DSV41_IMG_COMMIT to its commit. See README, V4.1 quick start." >&2
 fi
 EXTRA="${DSV41_EXTRA_ARGS:-}"   # e.g. --no-enable-prefix-caching for benchmarks
+# Scheduler A/B knob (vllm/v1/core/sched/scheduler.py): N = admit at most N
+# decodes per scheduler step so a burst takes several PP-ring slots instead of
+# one fused batch. 0/empty = stock. See bench/spread_decode_ab.sh.
+SPREAD="${DSV41_SPREAD_DECODE:-}"
 
 # shellcheck disable=SC2086
 # Pass through any NCCL_* variables set in the caller's environment (e.g.
@@ -139,6 +143,7 @@ docker run -d --name dsv41 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPUS" $N
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \
   -e VLLM_USE_BREAKABLE_CUDAGRAPH="$BREAKABLE" \
+  -e VLLM_DSV41_SPREAD_DECODE="$SPREAD" \
   -e PYTHONUNBUFFERED=1 \
   -v "$MODEL":/model \
   $MOUNTS \
@@ -155,4 +160,4 @@ docker run -d --name dsv41 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPUS" $N
 if [ "$ENGRAM" = "disk" ] && [ "$WARM_ENGRAM" = "1" ]; then
   nohup "$(dirname "$0")/warm-engram-cache.sh" "$MODEL" > /tmp/dsv41-warm-engram.log 2>&1 &
 fi
-echo "launched dsv41 on :$PORT  (maxlen $MAXLEN, engram $ENGRAM, partition $PARTITION, spec: ${SPEC:-none}, extra: ${EXTRA:-none})"
+echo "launched dsv41 on :$PORT  (maxlen $MAXLEN, engram $ENGRAM, partition $PARTITION, spec: ${SPEC:-none}, spread: ${SPREAD:-0}, extra: ${EXTRA:-none})"

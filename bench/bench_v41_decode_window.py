@@ -69,10 +69,11 @@ def main():
     ap.add_argument("--out", default="bench/bench_v41_decode_window.jsonl")
     ap.add_argument("--tag", default="")
     ap.add_argument("--stagger", type=float, default=0.0, help="seconds between request starts")
+    ap.add_argument("--seed", type=int, default=7000, help="first prompt seed; identical seeds on a warm engine are prefix-cache hits, a fresh seed is the cold case")
     args = ap.parse_args()
 
     outs = [{} for _ in range(args.conc)]
-    ths = [threading.Thread(target=stream, args=(args.url, args.model, make_prompt(args.ctx, 7000 + i),
+    ths = [threading.Thread(target=stream, args=(args.url, args.model, make_prompt(args.ctx, args.seed + i),
                                                   args.gen, args.timeout, outs[i])) for i in range(args.conc)]
     t0 = time.perf_counter()
     for t in ths:
