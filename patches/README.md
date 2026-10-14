@@ -20,11 +20,15 @@ git clone https://github.com/vllm-project/vllm.git && cd vllm
 git fetch origin refs/pull/56201/head && git checkout -B v41-sm80 79a7108d9a
 git rev-parse HEAD^{tree}     # a731238e73f0023b0a43f6d91c07c466295224e6
 git am ../deepseek-v4-cmp170hx/patches/v41/*.patch
-git rev-parse HEAD^{tree}     # 70aaaced9d8d2c2dce411b1aef19287c0134bf77
+git rev-parse HEAD^{tree}     # 5d70e193f04377f56ffce63b8458d8c75bf86b99 (nineteen patches)
 ```
 
 Verified 2026-09-10: `git am` of the eight patches onto a pristine `79a7108d9a` worktree
-applies with zero conflicts and reproduces tree `70aaaced…` byte-for-byte. If the PR is
+applies with zero conflicts and reproduces tree `70aaaced…` byte-for-byte, which is the tree
+baked into the published image. **Re-verified 2026-10-14 with all nineteen patches**
+(`git worktree add --detach … 79a7108d9a && git am patches/v41/*.patch`): zero conflicts, and
+the result is `5d70e193f0…`, byte-identical to the live `v41-sm80` checkout — i.e. this
+directory plus the PR head is the whole source tree, nothing rests on the working copy. If the PR is
 force-pushed and the SHA becomes unreachable, the tarball route from the V4 section
 works for `vllm-project/vllm` too; [docker/vastai-build-push-v41.sh](../docker/vastai-build-push-v41.sh)
 does both and checks both tree SHAs.
