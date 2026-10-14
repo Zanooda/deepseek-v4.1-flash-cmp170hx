@@ -124,8 +124,11 @@ Decode throughput is essentially flat in context length. It does depend on reque
 with pipeline parallelism vLLM packs all runnable requests into one micro-batch, so eight
 requests that become ready in the same step walk the eight stages as a single batch
 (274 tok/s) while requests that join one at a time overlap (532). Batches merge and never
-split; a scheduler patch to spread requests over the in-flight micro-batches is the open
-item. The older `bench_v41_matrix.py` "c=4 / c=8 decode collapse" numbers in RESULTS.md were
+split; **patch 0019 spreads them** over the in-flight micro-batches (launched by default as
+`VLLM_DSV41_SPREAD_DECODE=2`): the same 8 streams then run **560 tok/s warm / 571 cold** and
+16 streams reach **813**, i.e. the arrival dependence is gone — measurements, the arm sweep
+and its caveats in [RESULTS §11](RESULTS.md#11-decode-burst-spreading-patch-0019-vllm_dsv41_spread_decode).
+The older `bench_v41_matrix.py` "c=4 / c=8 decode collapse" numbers in RESULTS.md were
 this effect plus prefill interference, not decode scaling.
 
 **Memory**: KV pool 6,171,394 tokens at utilisation 0.95 (5.9 concurrent 1M-token

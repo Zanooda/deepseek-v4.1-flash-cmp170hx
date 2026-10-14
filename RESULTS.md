@@ -84,7 +84,8 @@ runnable request into one micro-batch. Eight requests that become runnable in th
 **274 and 280 tok/s** in two runs; 8 s staggered starts: 389; requests joining one at a time
 (cold prompts, 21 s prefills): 514–532. Batches only merge and never split, so sustained
 load drifts toward the low figure. A scheduler patch that spreads runnable requests over the
-in-flight micro-batches is the open item. `--max-num-seqs` is not that knob: it bounds the
+in-flight micro-batches is **section 11** (patch 0019: the same 8 streams then run 560 tok/s
+warm and 571 cold). `--max-num-seqs` is not that knob: it bounds the
 total number of running requests (1 gives "Running: 1, Waiting: 7").
 
 ## 5. Memory and KV pool
@@ -162,3 +163,42 @@ Gen2 x4 link, which P2P does not widen.
 - `--max-num-batched-tokens 8192` untested (another V4.1-on-170HX setup reports no gain).
 - No per-rank profile of the decode step; the 4 ms stages against a 1.5 ms bandwidth floor
   are the largest remaining single-stream lever.
+
+## 11. Decode burst spreading (patch 0019, `VLLM_DSV41_SPREAD_DECODE`)
+
+Section 4's collapse, attacked in the scheduler. The engine keeps `pp_size` (= 8 here)
+scheduler steps in flight (`max_concurrent_batches`, `vllm/config/vllm.py`), so the pipeline
+is only full when those slots carry *independent* batches; the stock scheduler instead fills
+every slot with every runnable request, and a burst therefore rides as one fused batch that
+walks the eight stages stage by stage. Patch 0019 (`patches/v41/0019`) admits at most N
+decodes per step and re-arms each admitted request `ceil(C/N)` steps later (C = running
+decodes), which spreads a burst over the ring.
+
+Measured 2026-10-14, same box and engine as everything else (PP=8, `5,5,5,5,5,5,5,5`, Engram
+pinned, DSpark 5, util 0.95), one engine restart per arm, `bench/spread_decode_ab.sh`, the
+prefill-free decode window at ~105k-token prompts (raw data:
+`bench/bench_v41_decode_window.jsonl`, tags `spread*`). Aggregate / per-stream tok/s at each
+run's peak bin:
+
+| arm | c=8 cold | c=8 warm | c=16 cold | c=16 warm |
+|---|---|---|---|---|
+| stock (patch absent, 2026-09-11 rows) | 531 / 66 | 274 / 34 | not measured | not measured |
+| N=1 | 498 / 62 | 446 / 56 | 449 / 75 — only 6 streams ever co-active | 167 / 83 — 2 streams |
+| **N=2** | **571 / 71** | **560 / 70** | **813 / 51** | **806 / 50** |
+| N=4 | 552 / 69 | 420 / 53 | 736 / 46 | 732 / 46 |
+
+N=2 is the best of the three and it is the one that matters: it **removes the cold/warm
+gap** (571 vs 560, where stock is 531 vs 274), i.e. the fused-batch penalty this knob targets
+is gone. N=1 starves the ring at c=16 — period 16 against 8 ring slots, so only 6 (cold) or 2
+(warm) streams were ever generating at once. N=4 overfills it (period 4 < ring depth) and
+loses to N=2. The n=1 bins stayed 54–83 tok/s in every arm, so single-stream is unaffected.
+
+Caveats: arm 0 was not re-run in this session, so the stock column is the 2026-09-11 rows
+with an equivalent but not identical prompt set (105.1k vs 104.8–105.0k tokens) — the same
+arm's own cold-vs-warm pair is the internal control. c=32 is unmeasured: the engine now runs
+`--max-num-seqs 32` with N=2, which makes the period 16, so per-stream latency doubles while
+aggregate should stay near the 813 of c=16 (the ring is already full at 8 slots × 2). The
+"period ≈ ring depth" rule that explains c=16 (N=2 → period 8) points at N=4 for 32
+concurrent; that arm is worth running. And `--max-num-seqs 32` is only a bound: the KV pool
+is 5.93M tokens, so 32 requests averaging above ~185k tokens will preempt (watch
+`num_preemptions` in `/metrics`).

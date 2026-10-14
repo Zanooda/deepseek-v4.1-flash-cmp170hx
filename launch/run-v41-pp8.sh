@@ -65,7 +65,7 @@ PARTITION="${VLLM_PP_LAYER_PARTITION:-5,5,5,5,5,5,5,5}"
 GPUS="${DSV41_GPUS:-0,1,2,3,4,5,7,6}"
 PORT="${DSV41_PORT:-8099}"
 MEMUTIL="${DSV41_MEMUTIL:-0.95}"
-MAXSEQS="${DSV41_MAX_SEQS:-16}"     # max RUNNING requests in total (not per micro-batch); 1 serialises users
+MAXSEQS="${DSV41_MAX_SEQS:-32}"     # max RUNNING requests in total (not per micro-batch); 1 serialises users. The 5.93M-token KV pool is the real limit: 32 requests averaging >185k tokens preempt
 # DSpark: block size 5 for this checkpoint (dspark_block_size=5), so 5 tokens
 # exactly, as on V4 (7 was slower there; below 5 is rejected). Adds ~7.8 GiB to
 # the last rank -- see the partition note in README.
@@ -129,8 +129,10 @@ fi
 EXTRA="${DSV41_EXTRA_ARGS:-}"   # e.g. --no-enable-prefix-caching for benchmarks
 # Scheduler A/B knob (vllm/v1/core/sched/scheduler.py): N = admit at most N
 # decodes per scheduler step so a burst takes several PP-ring slots instead of
-# one fused batch. 0/empty = stock. See bench/spread_decode_ab.sh.
-SPREAD="${DSV41_SPREAD_DECODE:-}"
+# one fused batch. 2 is the measured arm (RESULTS §11: 8 warm streams 560 tok/s
+# aggregate vs 274 stock, 16 streams 813; N=1 starves the ring, N=4 overfills
+# it). 0/empty = stock. Sweep it with bench/spread_decode_ab.sh.
+SPREAD="${DSV41_SPREAD_DECODE:-2}"
 
 # shellcheck disable=SC2086
 # Pass through any NCCL_* variables set in the caller's environment (e.g.
