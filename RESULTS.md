@@ -77,6 +77,10 @@ slots in which every stream is generating and no prefill is in flight count.
 | 105k | 8 | 460 / 464 tok/s | 58 | tables in RAM / page cache |
 | 420k | 4 | 411 tok/s | 103 | NVMe Engram |
 
+Every row here is the **stock scheduler** (patch 0019 not in the engine, 2026-09-11) and all
+of them are cold-prompt arrivals; the same runs with warm prompts were 274/280. Section 11
+is what changed that, and the note below it.
+
 Throughput is flat in context length. The 450–532 scatter at 105k × 8 is not the
 configuration but request arrival: with pipeline parallelism vLLM's scheduler puts every
 runnable request into one micro-batch. Eight requests that become runnable in the same step
@@ -94,13 +98,16 @@ total number of running requests (1 gives "Running: 1, Waiting: 7").
 |---|---|---|
 | utilisation 0.90, before patch 0011 | 2,827,499 tokens | 2.7 |
 | utilisation 0.90, patch 0011 | 3,151,289 tokens | 3.0 |
-| **utilisation 0.95 (launch default)** | **6,171,394 tokens** | 5.9 |
-| utilisation 0.90, partition `5,5,5,5,5,5,6,4` | 6,859,213 tokens | 6.5 |
+| utilisation 0.95 (launch default) | **6,171,394 tokens** | 5.9 |
+| utilisation 0.95, partition `5,5,5,5,5,5,6,4` | 6,859,213 tokens | 6.5 |
+| utilisation 0.95, 2026-10-13 tree (patches 0014–0019) | 5,928,408 tokens | 5.65 |
 
 The pool is decided by the last rank (52 GB of weights, drafter and `lm_head` plus non-torch
 memory leave it 3.3 GB at 0.90 and 6.5 GB at 0.95) and by vLLM's uniform block pool: every
 rank gets the same block count and a block costs each rank the page of its largest cache
-group. V4.1's own KV is about 2.3 kB per token over the whole model. Weights per rank:
+group. The last row is the live engine's own `/metrics` (`GPU KV cache size`) on the same
+utility 0.95; the 4 % drop against the 2026-09-11 figure is not attributed to a specific
+change. V4.1's own KV is about 2.3 kB per token over the whole model. Weights per rank:
 35.9 GB on ranks 1–6, 37.6 on rank 0, 46.3 on rank 7. Startup about 10 minutes (204 s of
 weight loading per rank, 89–98 s per Engram table into pinned RAM, then profiling and
 graph capture).

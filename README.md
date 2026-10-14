@@ -7,11 +7,11 @@ below was measured on that hardware.
 | | DeepSeek-V4.1-Flash on 8× CMP 170HX |
 |---|---|
 | decode, one stream | **117 tok/s** at 128k, 96 at 512k (text-dependent, see [RESULTS](RESULTS.md#3-decode-single-stream)) |
-| decode, 8 streams together | **532 tok/s** aggregate at 128k (66 per stream) |
+| decode, 8 streams together | **560 tok/s** aggregate at 128k, 70 per stream (patch 0019, the launch default); 806 at 16 streams — [RESULTS §11](RESULTS.md#11-decode-burst-spreading-patch-0019-vllm_dsv41_spread_decode) |
 | prefill, one stream | **6,066 tok/s** at 105k tokens (time to first token 17 s) |
 | concurrent prefill | ~6,900 tok/s aggregate, all cards at 92–96 % |
 | longest verified prompt | 1,007,820 tokens (the model's full 1M) |
-| KV pool | 6.17M tokens, 5.9 concurrent 1M requests |
+| KV pool | 6.17M tokens at 0.95, 5.9 concurrent 1M requests (5.93M on the current tree — [RESULTS §5](RESULTS.md#5-memory-and-kv-pool)) |
 | speculative decoding | DSpark, up to 6 tokens per step |
 
 This repository is based on the work in
@@ -112,13 +112,19 @@ the text: ~5.9 tokens per step on repetitive output (98–117 tok/s), ~3.9 on pr
 (61 tok/s). Read any decode figure against the prompt that produced it.
 
 **Decode, several streams together** (only the window in which every stream is generating
-and no prefill is in flight; `bench/bench_v41_decode_window.py`):
+and no prefill in flight; `bench/bench_v41_decode_window.py`):
 
-| prompt tokens | streams | aggregate | per stream |
-|---|---|---|---|
-| 26k | 8 | 452 tok/s | 56.5 |
-| 105k | 8 | **532 tok/s** | 66 |
-| 420k | 4 | 411 tok/s | 103 |
+| prompt tokens | streams | aggregate | per stream | scheduler |
+|---|---|---|---|---|
+| 26k | 8 | 452 tok/s | 56.5 | stock |
+| 105k | 8 | **532 tok/s** | 66 | stock (cold prompts; 274 warm) |
+| 420k | 4 | 411 tok/s | 103 | stock |
+| 105k | 8 | **560 tok/s** | 70 | patch 0019, N=2 |
+| 105k | 16 | **806 tok/s** | 50 | patch 0019, N=2 |
+
+The `stock` rows are the 2026-09-11 measurements in [RESULTS §4](RESULTS.md#4-decode-several-streams-together);
+the last two are the launch default since 2026-10-14 ([RESULTS §11](RESULTS.md#11-decode-burst-spreading-patch-0019-vllm_dsv41_spread_decode)),
+where the cold/warm arrival dependence that produced the 532-vs-274 spread is gone.
 
 Decode throughput is essentially flat in context length. It does depend on request arrival:
 with pipeline parallelism vLLM packs all runnable requests into one micro-batch, so eight
@@ -132,7 +138,7 @@ The older `bench_v41_matrix.py` "c=4 / c=8 decode collapse" numbers in RESULTS.m
 this effect plus prefill interference, not decode scaling.
 
 **Memory**: KV pool 6,171,394 tokens at utilisation 0.95 (5.9 concurrent 1M-token
-requests). The pool is set by the last rank, which has 46 GB of weights; V4.1's own KV is
+requests; the 2026-10-13 tree reports 5,928,408 for the same utility, [RESULTS §5](RESULTS.md#5-memory-and-kv-pool)). The pool is set by the last rank, which has 46 GB of weights; V4.1's own KV is
 tiny (~2.3 kB per token over the whole model). `5,5,5,5,5,5,6,4` gives 6.86M tokens but
 costs concurrent decode; a last rank with fewer than 4 layers cannot start (the drafter's
 auxiliary states come from layers 36–38).
