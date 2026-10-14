@@ -65,7 +65,7 @@ PARTITION="${VLLM_PP_LAYER_PARTITION:-5,5,5,5,5,5,5,5}"
 GPUS="${DSV41_GPUS:-0,1,2,3,4,5,7,6}"
 PORT="${DSV41_PORT:-8099}"
 MEMUTIL="${DSV41_MEMUTIL:-0.95}"
-MAXSEQS="${DSV41_MAX_SEQS:-8}"     # max RUNNING requests in total (not per micro-batch); 1 serialises users
+MAXSEQS="${DSV41_MAX_SEQS:-16}"     # max RUNNING requests in total (not per micro-batch); 1 serialises users
 # DSpark: block size 5 for this checkpoint (dspark_block_size=5), so 5 tokens
 # exactly, as on V4 (7 was slower there; below 5 is rejected). Adds ~7.8 GiB to
 # the last rank -- see the partition note in README.
