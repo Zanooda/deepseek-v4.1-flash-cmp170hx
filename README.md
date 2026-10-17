@@ -1,10 +1,11 @@
-# DeepSeek-V4 and V4.1 Flash on CMP 170HX mining cards
+# DeepSeek-V4 and V4.1 Flash-1017 on CMP 170HX mining cards
 
 vLLM patches, container builds, launch scripts and benchmark harnesses for
-**DeepSeek-V4.1-Flash** on eight 64 GB **CMP 170HX** (sm_80, PCIe Gen2 x4). Every number
-below was measured on that hardware.
+**DeepSeek-V4.1-Flash-1017** on eight 64 GB **CMP 170HX** (sm_80, PCIe Gen2 x4). Every
+number below was measured on that hardware with the pre-1017 weights (1017 is a weights-only
+refresh of them; see [Quick start](#quick-start-v41)).
 
-| | DeepSeek-V4.1-Flash on 8× CMP 170HX |
+| | DeepSeek-V4.1-Flash-1017 on 8× CMP 170HX |
 |---|---|
 | decode, one stream | **117 tok/s** at 128k, 96 at 512k (text-dependent, see [RESULTS](RESULTS.md#3-decode-single-stream)) |
 | decode, 8 streams together | **560 tok/s** aggregate at 128k, 70 per stream (patch 0019, the launch default); 806 at 16 streams — [RESULTS §11](RESULTS.md#11-decode-burst-spreading-patch-0019-vllm_dsv41_spread_decode) |
@@ -26,7 +27,7 @@ Deep dives: [SETTINGS.md](SETTINGS.md) (every flag and why), [RESULTS.md](RESULT
 
 ---
 
-## DeepSeek-V4.1-Flash on 8 cards
+## DeepSeek-V4.1-Flash-1017 on 8 cards
 
 vLLM support for V4.1 is [PR #56201](https://github.com/vllm-project/vllm/pull/56201);
 this repo ports the PR onto the sm_80 fork. On sm_80 the FP4 experts and FP8 dense layers
@@ -46,9 +47,16 @@ git am ~/deepseek-v4-cmp170hx/patches/v41/*.patch
 # 2. the image: sm_80-only SASS, built from the PR head + patches 0001-0008
 docker pull zanooda/vllm-sm80-ds41f:v41-sm80
 
-# 3. checkpoint deepseek-ai/DeepSeek-V4.1-Flash (510 GB, 48 shards) under /models, then
+# 3. checkpoint deepseek-ai/DeepSeek-V4.1-Flash-1017 (510 GB, 48 shards) under /models, then
 DSV41_VLLM_SRC=$HOME/vllm-v41/vllm ~/deepseek-v4-cmp170hx/launch/run-v41-pp8.sh
 ```
+
+The launch script defaults to `/models/DeepSeek-V4.1-Flash-1017`, the 2026-10-17 weights-only
+refresh: its `config.json`, `model.safetensors.index.json` and `tokenizer_config.json` are
+byte-identical to `deepseek-ai/DeepSeek-V4.1-Flash`, so the flag set below, the patch series
+and every number in RESULTS.md carry over — the numbers themselves were measured on the
+pre-1017 weights and have not been re-run on the refresh. The older build still runs with
+`DSV41_MODEL=/models/DeepSeek-V4.1-Flash`.
 
 **The bind mounts are not optional.** The published image contains patches 0001–0008 only,
 which is the part that needs a CUDA build. Patches 0009–0013 are Python-only and the launch

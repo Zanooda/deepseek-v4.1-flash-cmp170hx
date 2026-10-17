@@ -1,7 +1,10 @@
 # Settings: `launch/run-v41-pp8.sh`
 
 Every flag and variable the launch script sets, and the measurement behind it. Values are
-the launch defaults; the environment variable in the second column overrides each.
+the launch defaults; the environment variable in the second column overrides each. The
+measurements come from the pre-1017 `deepseek-ai/DeepSeek-V4.1-Flash` weights; the launch
+default is now the weights-only `-1017` refresh (byte-identical config.json, safetensors
+index and tokenizer_config.json), which has not been re-measured.
 
 ## Parallelism and layout
 

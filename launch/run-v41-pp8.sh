@@ -2,6 +2,11 @@
 # DeepSeek-V4.1-Flash on 8x CMP 170HX (GA100, sm_80, 64 GB each), PP=8.
 #
 # STATUS: RUNNING since 2026-09-10 (RESULTS.md).
+# Checkpoint: deepseek-ai/DeepSeek-V4.1-Flash-1017 (default below). It is a weights-only
+# refresh of the 2026-09 build: config.json, model.safetensors.index.json and
+# tokenizer_config.json are byte-identical, so every flag here, the patch series and the
+# RESULTS.md/SETTINGS.md numbers (measured on the pre-1017 weights) still apply. The older
+# build runs unchanged with DSV41_MODEL=/models/DeepSeek-V4.1-Flash.
 # Image zanooda/vllm-sm80-ds41f:v41-sm80 (tree 70aaaced9d) plus patches 0009-0013
 # bind-mounted from a v41-sm80 checkout (DSV41_VLLM_SRC); rebuild to bake them in.
 #
@@ -55,7 +60,7 @@
 #                      spread over 8 ranks) gives with room to spare.
 # ---- configure -------------------------------------------------------------------
 IMG="${DSV41_IMAGE:-zanooda/vllm-sm80-ds41f:v41-sm80}"
-MODEL="${DSV41_MODEL:-/models/DeepSeek-V4.1-Flash}"
+MODEL="${DSV41_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
 MAXLEN="${DSV41_MAXLEN:-1048576}"
 ROW_CHUNK="${DSV4_ROW_CHUNK:-64}"
 ENGRAM="${DSV41_ENGRAM:-cpu}"           # cpu (both tables pinned in host RAM, 2 x 101 GB; needs >= ~240 GB, the box has 278) | disk (+ page-cache warm) | gpu

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the serving stack on this box: DeepSeek-V4.1-Flash on all eight cards.
+# Start the serving stack on this box: DeepSeek-V4.1-Flash-1017 on all eight cards.
 # Everything (partition, memory, Engram in host RAM, device order, parsers) is
 # configured in launch/run-v41-pp8.sh; this only supplies the two things that
 # are specific to this host:

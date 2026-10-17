@@ -7,7 +7,7 @@
 # memory pressure it silently degrades back to NVMe reads.
 # usage: warm-engram-cache.sh [model-dir]   (waits for :8099/health first)
 set -u
-MODEL="${1:-/models/DeepSeek-V4.1-Flash}"
+MODEL="${1:-/models/DeepSeek-V4.1-Flash-1017}"
 PORT="${DSV41_PORT:-8099}"
 for i in $(seq 1 240); do curl -sf -m 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 5; done
 SHARDS=$(grep -lE '"(layers\.1|layers\.14)\.engram\.embed\.weight"' "$MODEL"/model-*.safetensors 2>/dev/null)
