@@ -59,12 +59,27 @@ bf16 peak, which puts the remaining prefill headroom in the Marlin W4A16 GEMMs a
 | 105k | 104–109 tok/s | **117 tok/s** |
 | 420k | 74–86 tok/s | **96 tok/s** |
 
-The step rate is constant at about 16 steps/s (60 ms per step, 8 stages plus the drafter).
-Tokens per step follow DSpark acceptance, which follows the text: about 5.9 tokens per step
-on repetitive output (98–117 tok/s), about 3.9 on prose-like output (61 tok/s). Early
-per-position acceptance on prose was 77 / 55 / 42 / 34 / 31 %. A 3,000-token generation
-holds a flat 97–101 tok/s from the first to the last 500 tokens, so decode does not slow with
-generated length.
+The step cadence does not grow with context. Measured 2026-10-18 with
+`bench/bench_decode_step.py` (one SSE chunk = one engine step under DSpark, so the chunk
+interval is the step period; `num_requests_running` was 1–2 because one other request was
+being served):
+
+| prompt tokens | median step | p10–p90 | tokens/step | decode tok/s |
+|---|---|---|---|---|
+| 4,128 | 40.6 ms | 39.2–41.6 | 2.5 | 62 |
+| 16,452 | 40.4 ms | 38.3–41.7 | 2.0 | 50 |
+| 32,780 | 40.5 ms | 36.2–44.9 | 2.0 | 49 |
+| 57,435 | 39.6 ms | 25.9–43.2 | 4.8 | 121 |
+| 81,776 | 55.6 ms | 53.7–57.3 | 2.8 | 51 (shared a live prefill) |
+| 114,749 | 41.2 ms | 40.4–44.4 | 2.4 | 58 |
+
+The earlier "~16 steps/s (60 ms)" figure is inconsistent with the 117 tok/s headline:
+6 tokens/step (DSpark 5 + target) bounds 117 tok/s at ≤51 ms/step. Read the cadence from the
+table above; tokens per step follow DSpark acceptance, which follows the text: about 5.9
+tokens per step on repetitive output (98–117 tok/s), about 3.9 on prose-like output
+(61 tok/s). Early per-position acceptance on prose was 77 / 55 / 42 / 34 / 31 %. A
+3,000-token generation holds a flat 97–101 tok/s from the first to the last 500 tokens, so
+decode does not slow with generated length.
 
 ## 4. Decode, several streams together
 

@@ -114,8 +114,9 @@ caveats in [RESULTS.md](RESULTS.md).
 | 419,430 | 88–106 s · 3,965–4,780 tok/s | **78.7 s · 5,328 tok/s** |
 | 1,007,820 | 468 s · 2,151 tok/s (measured before 0010/0011/0013; not re-run) | |
 
-**Decode, one stream**: 117 tok/s at 128k, 96 tok/s at 512k (Engram in RAM). The step rate
-is a constant ~16 steps/s; tokens per step depend on DSpark acceptance, which depends on
+**Decode, one stream**: 117 tok/s at 128k, 96 tok/s at 512k (Engram in RAM). The step
+cadence is flat in context (40–56 ms/step measured from 4k to 115k prompt tokens, RESULTS
+§3); tokens per step depend on DSpark acceptance, which depends on
 the text: ~5.9 tokens per step on repetitive output (98–117 tok/s), ~3.9 on prose
 (61 tok/s). Read any decode figure against the prompt that produced it.
 
@@ -200,10 +201,11 @@ launch/             run-v41-pp8.sh (PP=8 launch), warm-engram-cache.sh (page-cac
 run.sh              this box's entry point: run-v41-pp8.sh with the patched checkout and P2P
 bench/              bench_v41_check.py (coherence + needles), bench_v41_matrix.py
                     (context x concurrency), bench_v41_decode_window.py (prefill-free
-                    concurrent decode), metrics_window.py (reads /metrics twice and
-                    reports the step composition and per-token gaps in between),
-                    spread_decode_ab.sh (spread-decode A/B), v41_partition_trial.sh,
-                    and the raw *.jsonl
+                    concurrent decode), bench_decode_step.py (step cadence vs context
+                    from streaming chunk intervals), metrics_window.py (reads /metrics
+                    twice and reports the step composition and per-token gaps in
+                    between), spread_decode_ab.sh (spread-decode A/B),
+                    v41_partition_trial.sh, and the raw *.jsonl
 SETTINGS.md         every flag and environment variable, and why it has that value
 RESULTS.md          all measurements, correctness tests and what is not done
 ```
