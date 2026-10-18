@@ -1,7 +1,7 @@
-From 9743f741ebf2167df60f4a78af7fe8423f902dda Mon Sep 17 00:00:00 2001
+From 539ce7c258f8f5d1e6143145d99668b051e0e917 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Fri, 11 Sep 2026 15:14:22 +0000
-Subject: [PATCH 13/18] Engram storage=cpu: load the pinned tables without a
+Subject: [PATCH 13/19] Engram storage=cpu: load the pinned tables without a
  host-memory transient
 
 Two things made `--engram-config '{"storage":"cpu"}'` OOM-kill the two
@@ -30,12 +30,12 @@ gather: 128k single-stream TTFT 21.3-23.5 s -> 17.3 s (6,066 tok/s prefill),
 512k 88-106 s -> 78.7 s, 32k 8.1 s -> 5.8 s; decode at 128k 104-109 ->
 117 tok/s.
 ---
- vllm/models/deepseek_v4_1/common/engram.py | 128 ++++++++++++++++++---
+ vllm/models/deepseek_v4_1/common/engram.py | 130 ++++++++++++++++++---
  vllm/models/deepseek_v4_1/nvidia/model.py  |  13 ++-
- 2 files changed, 123 insertions(+), 18 deletions(-)
+ 2 files changed, 125 insertions(+), 18 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
-index fdcc19fc11..61f00207cb 100644
+index fdcc19fc11..739d98ee77 100644
 --- a/vllm/models/deepseek_v4_1/common/engram.py
 +++ b/vllm/models/deepseek_v4_1/common/engram.py
 @@ -40,6 +40,7 @@ import json
@@ -71,7 +71,17 @@ index fdcc19fc11..61f00207cb 100644
  class ParallelEngramEmbedding(nn.Module):
      """The n-gram hash table, sharded by complete hash heads over TP ranks.
      Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
-@@ -1021,24 +1040,49 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -986,6 +1005,9 @@ class ParallelEngramEmbedding(nn.Module):
+         self._num_sms = torch.cuda.get_device_properties(
+             torch.accelerator.current_device_index()
+         ).multi_processor_count
++        # Must exist in every storage mode: the disk branch returns early and
++        # load_weights asks every instance `needs_checkpoint_fill()`.
++        self._pinned_fill: tuple[str, str] | None = None
+ 
+         if storage == "disk":
+             # No parameters at all: the loader never sees these tensors (they
+@@ -1021,24 +1043,48 @@ class ParallelEngramEmbedding(nn.Module):
              return
          self.disk = None
  
@@ -81,7 +91,6 @@ index fdcc19fc11..61f00207cb 100644
 +        # what OOM-killed the workers on a 278 GB host. Skip the tensors in
 +        # the loader and fill the pinned buffers straight from the shard in
 +        # chunks after loading (fill_pinned_from_checkpoint).
-+        self._pinned_fill: tuple[str, str] | None = None
 +        if cpu_offload and hf_prefix is not None:
 +            from vllm.model_executor.model_loader.weight_utils import (
 +                register_skip_weight_names,
@@ -138,7 +147,7 @@ index fdcc19fc11..61f00207cb 100644
          for param in (self.weight, self.weight_scale_inv):
              set_weight_attrs(
                  param,
-@@ -1056,6 +1100,56 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1056,6 +1102,56 @@ class ParallelEngramEmbedding(nn.Module):
                  self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
              )
  

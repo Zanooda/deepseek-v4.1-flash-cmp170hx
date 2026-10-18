@@ -1,7 +1,7 @@
-From b37bce5074065b202629967d7689c4330cb9c4ac Mon Sep 17 00:00:00 2001
+From 9b2c6704bf33ce06fa0403d38c6286e8691caf61 Mon Sep 17 00:00:00 2001
 From: Danylo Storozhev <office@storozhev.net>
 Date: Mon, 21 Sep 2026 20:25:41 +0000
-Subject: [PATCH 18/18] [Bugfix][Spec Decode][Structured Output] Fail-closed
+Subject: [PATCH 18/19] [Bugfix][Spec Decode][Structured Output] Fail-closed
  drafts past the constrained bitmask rows (port PR #54442)
 
 Port of upstream vLLM PR #54442 (ec1125926) to our base. Fixes the recurring

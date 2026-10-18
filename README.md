@@ -39,7 +39,7 @@ or, on smaller hosts, are gathered per step from the NVMe shards.
 ### Quick start (V4.1)
 
 ```bash
-# 1. the patched vLLM tree: PR #56201 head + all 19 patches (tree 5d70e193f0)
+# 1. the patched vLLM tree: PR #56201 head + all 19 patches (tree 40548eea29)
 git clone https://github.com/vllm-project/vllm.git ~/vllm-v41 && cd ~/vllm-v41
 git fetch origin pull/56201/head && git checkout -b v41-sm80 79a7108d9a
 git am ~/deepseek-v4-cmp170hx/patches/v41/*.patch
