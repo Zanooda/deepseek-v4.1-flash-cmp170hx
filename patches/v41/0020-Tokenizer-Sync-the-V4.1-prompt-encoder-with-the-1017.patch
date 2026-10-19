@@ -1,0 +1,137 @@
+From b2bdeb03379393fb302e4a7f828ff539d7025310 Mon Sep 17 00:00:00 2001
+From: Danylo Storozhev <office@storozhev.net>
+Date: Mon, 19 Oct 2026 07:01:20 +0000
+Subject: [PATCH] [Tokenizer] Sync the V4.1 prompt encoder with the 1017
+ reference (PR #62196)
+
+The 1017 checkpoint changed the reference encoder: a user message that contains
+only tool results no longer starts a new assistant turn, so the reasoning emitted
+before a tool call stays in the current turn instead of being dropped by
+drop_thinking. Tool messages also carry content blocks into the tool_result, and
+encode_messages hoists the last-user index once.
+
+Serving the old rule rendered an empty think block after every tool result and
+deleted the assistant's pre-call reasoning, i.e. an out-of-distribution prompt in
+the middle of an agentic loop -- the state in which V4.1 drifts into ad-hoc XML
+tool calls.
+
+Partial port of vllm-project/vllm#62196: only the Python tokenizer hunk (the Rust
+frontend hunk is skipped, VLLM_USE_RUST_FRONTEND is off). The deepseek_v41.py
+image-placeholder guard from that PR does not apply to this base.
+
+Verified: encode_messages on a reasoning + tool_call + tool + assistant
+conversation now matches /models/DeepSeek-V4.1-Flash-1017/encoding/encoding.py
+byte for byte; reference fixtures test_input_2/3/4 render identically and 5
+matches after vLLM's content flattening. Remaining known divergence:
+REASONING_EFFORT_MAPPINGS (high=50 here, 75 in the reference).
+---
+ vllm/tokenizers/deepseek_v41_encoding.py | 33 ++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index a3555816d7..930ce66783 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -86,10 +86,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+ 
+         if role == "tool":
+             # Convert tool message to a user message with tool_result block
++            content = msg.get("content", "")
++            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
++                content = msg["content_blocks"]
+             tool_block = {
+                 "type": "tool_result",
+                 "tool_use_id": msg.get("tool_call_id", ""),
+-                "content": msg.get("content", ""),
++                "content": content,
+             }
+             # Merge into previous message if it's already a user (merged tool)
+             if (
+@@ -108,7 +111,12 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         elif role == "user":
+             content_blocks = msg.get("content_blocks")
+             if content_blocks is None:
+-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
++                content = msg.get("content", "")
++                content_blocks = (
++                    content
++                    if isinstance(content, list)
++                    else [{"type": "text", "text": content}]
++                )
+             if (
+                 merged
+                 and merged[-1].get("role") == "user"
+@@ -297,11 +305,18 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+ 
+     V4.1 supports mid-conversation system messages, which count as user
+     messages for the purposes of the assistant generation header.
++    User messages containing only tool results do not start a new turn.
+     """
+     last_user_index = -1
+     for idx in range(len(messages) - 1, -1, -1):
+         role = messages[idx].get("role")
+         if role in ["user", "developer"] or (role == "system" and idx > 0):
++            content_blocks = messages[idx].get("content_blocks")
++            if content_blocks and not any(
++                block.get("type") in ("text", "image", "image_url")
++                for block in content_blocks
++            ):
++                continue
+             last_user_index = idx
+             break
+     return last_user_index
+@@ -313,6 +328,7 @@ def render_message(
+     thinking_mode: str,
+     drop_thinking: bool = True,
+     reasoning_effort: Union[str, int, None] = None,
++    last_user_idx: Optional[int] = None,
+ ) -> str:
+     """
+     Render a single message at the given index into its V4.1 encoded string form.
+@@ -323,7 +339,9 @@ def render_message(
+     )
+ 
+     msg = messages[index]
+-    last_user_idx = find_last_user_index(messages)
++    last_user_idx = (
++        find_last_user_index(messages) if last_user_idx is None else last_user_idx
++    )
+ 
+     role = msg.get("role")
+     content = msg.get("content")
+@@ -540,14 +558,10 @@ def encode_messages(
+     reasoning_effort: Union[str, int, None] = None,
+ ) -> str:
+     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
+-    context = context if context else []
+-
+     # Preprocess: merge tool messages and sort tool results
++    context = merge_tool_messages(context or [])
+     messages = merge_tool_messages(messages)
+     messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
+-    if context:
+-        context = merge_tool_messages(context)
+-        context = sort_tool_results_by_call_order(context)
+ 
+     full_messages = context + messages
+ 
+@@ -566,6 +580,8 @@ def encode_messages(
+         num_to_render = len(messages)
+         context_len = len(context)
+ 
++    last_user_idx = find_last_user_index(full_messages)
++
+     for idx in range(num_to_render):
+         prompt += render_message(
+             idx + context_len,
+@@ -573,6 +589,7 @@ def encode_messages(
+             thinking_mode=thinking_mode,
+             drop_thinking=effective_drop_thinking,
+             reasoning_effort=reasoning_effort,
++            last_user_idx=last_user_idx,
+         )
+ 
+     return prompt
+-- 
+2.53.0
+

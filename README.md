@@ -2,8 +2,9 @@
 
 vLLM patches, container builds, launch scripts and benchmark harnesses for
 **DeepSeek-V4.1-Flash-1017** on eight 64 GB **CMP 170HX** (sm_80, PCIe Gen2 x4). Every
-number below was measured on that hardware with the pre-1017 weights (1017 is a weights-only
-refresh of them; see [Quick start](#quick-start-v41)).
+number below was measured on that hardware with the pre-1017 weights (1017 keeps the weights
+and config but ships a changed reference encoder — patch 0020; see
+[Quick start](#quick-start-v41)).
 
 | | DeepSeek-V4.1-Flash-1017 on 8× CMP 170HX |
 |---|---|
@@ -39,7 +40,7 @@ or, on smaller hosts, are gathered per step from the NVMe shards.
 ### Quick start (V4.1)
 
 ```bash
-# 1. the patched vLLM tree: PR #56201 head + all 19 patches (tree 40548eea29)
+# 1. the patched vLLM tree: PR #56201 head + all 20 patches (tree d94db01eab)
 git clone https://github.com/vllm-project/vllm.git ~/vllm-v41 && cd ~/vllm-v41
 git fetch origin pull/56201/head && git checkout -b v41-sm80 79a7108d9a
 git am ~/deepseek-v4-cmp170hx/patches/v41/*.patch
@@ -57,6 +58,13 @@ byte-identical to `deepseek-ai/DeepSeek-V4.1-Flash`, so the flag set below, the 
 and every number in RESULTS.md carry over — the numbers themselves were measured on the
 pre-1017 weights and have not been re-run on the refresh. The older build still runs with
 `DSV41_MODEL=/models/DeepSeek-V4.1-Flash`.
+
+The refresh is not entirely weights-only on the prompt side: the checkpoint's
+`encoding/encoding.py` changed on 2026-10-16 (tool-result-only user messages no longer start
+a new assistant turn, so the reasoning before a tool call survives). Patch 0020 syncs
+`vllm/tokenizers/deepseek_v41.py`'s encoder to it; without it the engine drops that reasoning
+and emits an empty think block after every tool result, which is when the model drifts into
+ad-hoc XMl tool calls.
 
 **The bind mounts are not optional.** The published image contains patches 0001–0008 only,
 which is the part that needs a CUDA build. Patches 0009–0013 are Python-only and the launch
@@ -194,7 +202,7 @@ B30, or a BIOS/BMC option if the board has one. Do nothing if it reads "Not Acti
 ## Repo layout
 
 ```
-patches/v41/        the 19 patches on vLLM PR #56201 head 79a7108d9a; notes in patches/README.md
+patches/v41/        the 20 patches on vLLM PR #56201 head 79a7108d9a; notes in patches/README.md
 patches/            the earlier DeepSeek-V4-Flash series (0001-0009) this work built on
 docker/             Dockerfile.fullbuild and vastai-build-push-v41.sh (verifies both tree SHAs)
 launch/             run-v41-pp8.sh (PP=8 launch), warm-engram-cache.sh (page-cache Engram)

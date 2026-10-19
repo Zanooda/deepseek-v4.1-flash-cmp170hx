@@ -3,8 +3,8 @@
 Everything here was measured on one box between 2026-09-10 and 2026-09-11: eight CMP 170HX
 (GA100, sm_80, 64 GB, Gen2 x4), one EPYC 7402P, 278 GB DDR4 (247 GB and 32 GB during the
 earlier runs, noted where it matters), the checkpoint on local NVMe (the pre-1017
-`deepseek-ai/DeepSeek-V4.1-Flash` weights — the 2026-10-17 `-1017` refresh is a weights-only
-update and was not re-measured here), image
+`deepseek-ai/DeepSeek-V4.1-Flash` weights — the 2026-10-17 `-1017` refresh keeps the weights
+but changes the reference encoder (patch 0020) and was not re-measured here), image
 `zanooda/vllm-sm80-ds41f:v41-sm80` plus the bind-mounted patches. Unless stated otherwise:
 PP=8 with `5,5,5,5,5,5,5,5`, `--max-model-len 1048576`, DSpark with 5 draft tokens, greedy
 decoding, unique word-salad prompts, prefix cache cold. Harnesses are in `bench/`, raw data
